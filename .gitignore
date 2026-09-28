@@ -2,6 +2,7 @@ jobs/data/
 logs/
 python/
 __pycache__/
+*.pyc
 *.bin
 *.log
 step7_result.txt
