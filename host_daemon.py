@@ -35,6 +35,9 @@ ALLOWED_JOBS = {
 # A second counts as "GPU really working" if utilization is at least this %.
 BUSY_THRESHOLD = 20
 
+# Safety net: any job running longer than this gets killed, so the host never gets stuck.
+MAX_JOB_SECONDS = 120
+
 # ---------------------------------------------------------------------------
 # 2. CONNECT TO THE GPU (NVML = NVIDIA's built-in reporting library)
 # ---------------------------------------------------------------------------
@@ -77,35 +80,59 @@ def current_job_id():
 
 
 def run_and_watch(job_id, script_path):
-    """Runs in a background thread: start the job, photograph the GPU every second."""
+    """Runs in a background thread: start the job, photograph the GPU every second.
+    Built so that whatever goes wrong, the job ALWAYS ends with a final status."""
     job = jobs[job_id]
     log_path = LOG_DIR / f"{job_id}.log"
+    proc = None
+    timed_out = False
+    error = None
 
-    with open(log_path, "w") as log:
-        proc = subprocess.Popen(
-            [sys.executable, str(script_path)],
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            cwd=str(script_path.parent),
-        )
-        with lock:
-            job["pid"] = proc.pid
-
-        while proc.poll() is None:          # None means "still running"
-            sample = read_gpu()
+    try:
+        with open(log_path, "w") as log:
+            proc = subprocess.Popen(
+                [sys.executable, str(script_path)],
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                cwd=str(script_path.parent),
+            )
             with lock:
-                job["samples"].append(sample)
-            time.sleep(1)
+                job["pid"] = proc.pid
 
-    ended = time.time()
-    with lock:
-        samples = job["samples"]
-        job["status"] = "finished" if proc.returncode == 0 else "failed"
-        job["ended_at"] = round(ended, 2)
-        job["runtime_s"] = round(ended - job["started_at"], 1)
-        job["busy_seconds"] = sum(1 for s in samples if s["gpu_util"] >= BUSY_THRESHOLD)
-        job["peak_util"] = max((s["gpu_util"] for s in samples), default=0)
-        job["peak_mem_mb"] = max((s["mem_used_mb"] for s in samples), default=0)
+            while proc.poll() is None:          # None means "still running"
+                if time.time() - job["started_at"] > MAX_JOB_SECONDS:
+                    proc.kill()                  # stuck job -> force stop
+                    proc.wait()
+                    timed_out = True
+                    break
+                try:
+                    sample = read_gpu()
+                    with lock:
+                        job["samples"].append(sample)
+                except Exception as e:           # one bad reading must not kill the watcher
+                    print(f"[{job_id}] GPU read failed: {e}", flush=True)
+                time.sleep(1)
+    except Exception as e:
+        error = str(e)
+        print(f"[{job_id}] watcher error: {e}", flush=True)
+        if proc and proc.poll() is None:
+            proc.kill()
+    finally:
+        ended = time.time()
+        with lock:
+            samples = job["samples"]
+            if error:
+                job["status"] = "failed"
+                job["error"] = error
+            elif timed_out:
+                job["status"] = "timeout"
+            else:
+                job["status"] = "finished" if proc and proc.returncode == 0 else "failed"
+            job["ended_at"] = round(ended, 2)
+            job["runtime_s"] = round(ended - job["started_at"], 1)
+            job["busy_seconds"] = sum(1 for s in samples if s["gpu_util"] >= BUSY_THRESHOLD)
+            job["peak_util"] = max((s["gpu_util"] for s in samples), default=0)
+            job["peak_mem_mb"] = max((s["mem_used_mb"] for s in samples), default=0)
 
 
 def log_tail(job_id, lines=8):

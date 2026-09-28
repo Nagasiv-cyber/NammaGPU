@@ -20,7 +20,7 @@ def load_data(device):
     """Real MNIST if available (pre-download it!), otherwise random fake images."""
     try:
         from torchvision import datasets
-        ds = datasets.MNIST(DATA_DIR, train=True, download=True)
+        ds = datasets.MNIST(DATA_DIR, train=True, download=False)  # never download during a demo
         x = ds.data.float().div(255).unsqueeze(1)   # shape: 60000 x 1 x 28 x 28
         y = ds.targets
         print("Data: real MNIST", flush=True)
