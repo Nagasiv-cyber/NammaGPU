@@ -1,0 +1,9 @@
+jobs/data/
+logs/
+python/
+__pycache__/
+*.bin
+*.log
+step7_result.txt
+auto_pipeline.py
+auto_pipeline.log
