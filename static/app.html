@@ -436,6 +436,7 @@ async function pollHosts() {
     const suspended = CHAIN.enabled && CHAIN.host_stake !== undefined && CHAIN.host_stake < CHAIN.min_stake;
     let state = HOST.status, text;
     if (HOST.status === "offline") text = "unreachable";
+    else if (HOST.status === "paused") { state = "offline"; text = "paused by its owner"; }
     else if (suspended) { state = "offline"; text = "suspended"; }
     else text = HOST.status === "busy" ? "busy" : "free";
     const short = HOST.gpu ? HOST.gpu.replace("NVIDIA GeForce ", "").replace(" Laptop GPU", "") : "GPU";
@@ -443,10 +444,11 @@ async function pollHosts() {
     $("hostText").textContent = short + " " + text;
     $("hmGpu").textContent = short;
     $("hmState").textContent = text.charAt(0).toUpperCase() + text.slice(1);
-    $("qGpu").textContent = HOST.status === "offline" ? "Unreachable, cloud fallback will be used"
+    $("qGpu").textContent = HOST.status === "paused" ? "Paused by its owner, cloud fallback will be used"
+      : HOST.status === "offline" ? "Unreachable, cloud fallback will be used"
       : suspended ? "Suspended, cloud fallback will be used" : (HOST.gpu || HOST.host_id).replace("NVIDIA GeForce ", "") + ", " + (HOST.status === "busy" ? "busy" : "free");
     $("gName").textContent = HOST.gpu || HOST.host_id;
-    $("gState").textContent = suspended ? "Suspended: deposit slashed" : HOST.status === "offline" ? "Offline" : HOST.status === "busy" ? "Running a job" : "Online, waiting for jobs";
+    $("gState").textContent = suspended ? "Suspended: deposit slashed" : HOST.status === "paused" ? "Paused: " + (HOST.pause_reason || "by owner") : HOST.status === "offline" ? "Offline" : HOST.status === "busy" ? "Running a job" : "Online, waiting for jobs";
     $("gSandbox").textContent = HOST.sandbox === "docker" ? "Sealed Docker sandbox" : "Sandbox off";
   } catch (e) {
     $("hostDot").className = "dot offline"; $("hostText").textContent = "Marketplace not responding";

@@ -25,6 +25,7 @@ from collections import deque
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -124,6 +125,7 @@ def host_status(host):
             info = host_call(host, "/")
             return {"host_id": host["host_id"], "url": host["url"],
                     "gpu": info.get("gpu"), "status": info.get("status"),
+                    "pause_reason": info.get("pause_reason"),
                     "sandbox": info.get("sandbox", "none")}
         except Exception as e:
             last_error = e
@@ -344,6 +346,9 @@ def cloud_detail(job):
 # ---------------------------------------------------------------------------
 app = FastAPI(title="NammaGPU Marketplace")
 
+# The host portal runs on the host's own laptop and reads earnings from here.
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
 
 class JobRequest(BaseModel):
     job_type: str = "mnist"      # "fake" = fraud demo (cheating host)
@@ -411,7 +416,10 @@ def submit_job(req: JobRequest):
     reasons = []
     for h in HOSTS:
         with match_guard:
-            status = "reserved" if h["host_id"] in reserved else host_status(h)["status"]
+            hs = host_status(h)
+            status = "reserved" if h["host_id"] in reserved else hs["status"]
+            if status == "paused":
+                status = f"paused ({hs.get('pause_reason') or 'by its owner'})"
             if status == "idle":
                 deposit = host_deposit_status(h)
                 if deposit == "slashed":
@@ -489,6 +497,57 @@ def job_file(job_id: str, name: str):
     if name not in delivered:
         raise HTTPException(404, "No such delivered file")
     return FileResponse(RESULTS_DIR / job_id / name, filename=name)
+
+
+@app.get("/api/host/summary")
+def host_summary():
+    """Everything the host portal shows about money and reputation."""
+    peer = [j for j in jobs.values() if j.get("source") == "peer" and j.get("status") not in (None, "running")]
+    paid = [j for j in peer if j.get("chain", {}).get("status") == "settled"
+            or (j.get("chain", {}).get("status") == "off" and (j.get("audit") or {}).get("verdict") == "honest")]
+    today = time.strftime("%Y-%m-%d")
+    earned = lambda js: round(sum((j.get("chain", {}).get("paid_to_host")
+                                   if j.get("chain", {}).get("status") == "settled"
+                                   else j.get("bill", {}).get("billed_amount", 0)) or 0 for j in js), 6)
+    summary = {
+        "symbol": SYMBOL,
+        "earned_total": earned(paid),
+        "earned_today": earned([j for j in paid if time.strftime("%Y-%m-%d", time.localtime(j["submitted_at"])) == today]),
+        "jobs_honest": sum(1 for j in peer if (j.get("audit") or {}).get("verdict") == "honest"),
+        "jobs_slashed": sum(1 for j in peer if (j.get("audit") or {}).get("verdict") == "fraud"),
+        "recent": [{"job_id": j["job_id"], "verdict": (j.get("audit") or {}).get("verdict"),
+                    "verified_seconds": j.get("bill", {}).get("verified_seconds"),
+                    "earned": (j.get("chain", {}).get("paid_to_host") if j.get("chain", {}).get("status") == "settled"
+                               else (0 if (j.get("audit") or {}).get("verdict") == "fraud" else j.get("bill", {}).get("billed_amount"))),
+                    "submitted_at": j["submitted_at"]}
+                   for j in sorted(peer, key=lambda j: j["submitted_at"], reverse=True)[:10]],
+        "chain": chain is not None,
+    }
+    if chain is not None:
+        try:
+            wallet = chain.address("host")
+            summary.update(wallet=wallet, wallet_balance=round(chain.balance("host"), 6),
+                           deposit=round(chain.host_stake(wallet), 6), min_deposit=MIN_STAKE)
+        except Exception as e:
+            summary["chain_error"] = f"Could not read MST testnet: {e}"
+    return summary
+
+
+@app.post("/api/host/restake")
+def host_restake():
+    """DEMO ONLY: the marketplace holds the host's test key, so it can put up the deposit.
+    In production the host signs this with their own wallet."""
+    if chain is None:
+        raise HTTPException(400, "The blockchain is off in this setup.")
+    wallet = chain.address("host")
+    current = chain.host_stake(wallet)
+    if current >= MIN_STAKE:
+        return {"status": "already_staked", "deposit": current}
+    try:
+        tx = chain.register_host(MIN_STAKE)
+    except Exception as e:
+        raise HTTPException(502, f"Could not put up the deposit on MST testnet: {e}")
+    return {"status": "staked", "deposit": MIN_STAKE, "tx": tx, "tx_url": chain.tx_url(tx)}
 
 
 @app.get("/api/jobs")
