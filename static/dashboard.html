@@ -106,6 +106,16 @@
   .result { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); font-size: 14px; }
   pre { background: var(--bg); padding: 10px; border-radius: 4px; font-size: 12px; overflow-x: auto; margin: 10px 0 0; }
 
+  .chain { margin-top: 14px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 6px; font-size: 14px; }
+  .chain h3 { font-size: 14px; margin: 0 0 6px; }
+  .chain .row { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0; flex-wrap: wrap; }
+  .chain .row span:first-child { color: var(--muted); }
+  .chain a { color: var(--gpu); font-weight: 600; }
+  .chain .pending { color: var(--billed); font-weight: 600; }
+  .chain .bad { color: var(--danger); font-weight: 600; }
+  .wallets { font-size: 13px; color: #AEB8C4; margin-top: 14px; padding-top: 12px; border-top: 1px solid #33405A; }
+  .wallets b { color: #F4F6F8; font-family: var(--num); font-weight: 600; }
+
   table { width: 100%; border-collapse: collapse; font-size: 14px; }
   th { text-align: left; font-weight: 600; color: var(--muted); padding: 8px 6px; border-bottom: 1px solid var(--line); }
   td { padding: 8px 6px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
@@ -142,7 +152,7 @@
       <div class="label">Verified GPU time</div>
       <div class="big"><span id="mVerified">0</span><span class="unit">sec</span></div>
       <div class="label">Amount due</div>
-      <div class="amount"><span id="mAmount">0.000000</span> MSTC</div>
+      <div class="amount"><span id="mAmount">0.000000</span> <span class="sym">MSTC</span></div>
       <dl>
         <dt>Time on host</dt><dd id="mWall">0.0 s</dd>
         <dt>Rate</dt><dd id="mRate">0.001 MSTC / verified sec</dd>
@@ -150,6 +160,7 @@
         <dt>GPU memory</dt><dd id="mMem">–</dd>
         <dt>Temperature</dt><dd id="mTemp">–</dd>
       </dl>
+      <div class="wallets" id="wallets" hidden></div>
     </section>
   </div>
 
@@ -178,6 +189,7 @@
         <div class="s">Startup and idle seconds are never billed.</div>
       </div>
     </div>
+    <div class="chain" id="rChain" hidden></div>
     <div class="result" id="rResult"></div>
     <pre id="rLog"></pre>
   </section>
@@ -185,7 +197,7 @@
   <section class="panel">
     <h2>Job history</h2>
     <table>
-      <thead><tr><th>Job</th><th>Host</th><th>Status</th><th class="num">Verified sec</th><th class="num">Billed (MSTC)</th></tr></thead>
+      <thead><tr><th>Job</th><th>Host</th><th>Status</th><th class="num">Verified sec</th><th class="num">Billed (<span class="sym">MSTC</span>)</th></tr></thead>
       <tbody id="history"></tbody>
     </table>
     <div class="empty" id="historyEmpty">No jobs yet. Run a training job to see it here.</div>
@@ -198,6 +210,10 @@ const BUSY = 20;             // same rule as the backend: >= 20% = GPU really wo
 const WINDOW = 60;           // seconds of history shown on the graph
 const live = [];             // rolling list of GPU readings
 let currentJob = null;
+let liveFailures = 0;
+let submitting = false;      // true while a job request is on its way (payment locking)        // only show "unreachable" after several misses in a row
+let SYMBOL = "MSTC";
+let CHAIN = { enabled: false };
 let jobSamples = [];
 
 const $ = id => document.getElementById(id);
@@ -276,14 +292,17 @@ function drawTape() {
 async function pollLive() {
   try {
     const r = await api("/api/live");
+    liveFailures = 0;
     live.push(r);
     if (live.length > WINDOW) live.shift();
-    $("mUtil").textContent = r.gpu_util + " %";
-    $("mMem").textContent = r.mem_used_mb + " / " + r.mem_total_mb + " MB";
+    const asleep = r.gpu_state === "sleeping";
+    $("mUtil").textContent = asleep ? "Sleeping (power saving)" : r.gpu_util + " %";
+    $("mMem").textContent = asleep ? "–" : r.mem_used_mb + " / " + r.mem_total_mb + " MB";
     $("mTemp").textContent = r.temp_c == null ? "–" : r.temp_c + " °C";
     drawChart();
   } catch (e) {
-    setHost(null, "offline", "Host unreachable");
+    liveFailures += 1;
+    if (liveFailures >= 3) setHost(null, "offline", "Host unreachable");
   }
 }
 
@@ -293,7 +312,7 @@ async function pollHosts() {
     const h = hosts[0];
     setHost(h.gpu || h.host_id, h.status,
       h.status === "offline" ? "Host unreachable" : (h.status === "busy" ? "Running a job" : "Idle, ready for work"));
-    if (!currentJob) $("runBtn").disabled = h.status !== "idle";
+    if (!currentJob && !submitting) $("runBtn").disabled = h.status !== "idle";
   } catch (e) {
     setHost(null, "offline", "Marketplace backend not responding");
   }
@@ -305,11 +324,72 @@ function setHost(name, status, text) {
   $("hostState").textContent = text;
 }
 
+/* ---------- blockchain ---------- */
+async function loadChain() {
+  try {
+    CHAIN = await api("/api/chain");
+    SYMBOL = CHAIN.symbol || SYMBOL;
+    document.querySelectorAll(".sym").forEach(el => el.textContent = SYMBOL);
+    if (CHAIN.rate_per_sec) $("mRate").textContent = CHAIN.rate_per_sec + " " + SYMBOL + " / verified sec";
+    const w = $("wallets");
+    if (CHAIN.enabled && CHAIN.buyer_balance !== undefined) {
+      w.innerHTML = "Buyer wallet <b>" + CHAIN.buyer_balance.toFixed(4) + "</b> " + SYMBOL +
+        "<br>Host wallet <b>" + CHAIN.host_balance.toFixed(4) + "</b> " + SYMBOL +
+        "<br>Host security deposit <b>" + CHAIN.host_stake.toFixed(4) + "</b> " + SYMBOL;
+      w.hidden = false;
+    } else if (CHAIN.enabled && CHAIN.error) {
+      w.textContent = CHAIN.error;
+      w.hidden = false;
+    }
+  } catch (e) { /* chain info is optional */ }
+}
+
+function txLink(url, hash) {
+  if (!hash) return "";
+  const short = hash.slice(0, 10) + "…" + hash.slice(-6);
+  return url ? `<a href="${url}" target="_blank" rel="noopener">${short}</a>` : short;
+}
+
+function renderChain(c) {
+  const box = $("rChain");
+  if (!c || c.status === "off") { box.hidden = true; return; }
+  let settleRow;
+  if (c.status === "settled") {
+    settleRow = `<div class="row"><span>Settlement</span><span>${txLink(c.settle_url, c.settle_tx)}</span></div>
+      <div class="row"><span>Paid to host</span><span>${c.paid_to_host} ${SYMBOL}</span></div>
+      <div class="row"><span>Refunded to buyer</span><span>${c.refunded_to_buyer} ${SYMBOL}</span></div>`;
+  } else if (c.status === "failed") {
+    settleRow = `<div class="row"><span>Settlement</span><span class="bad">${c.error}</span></div>`;
+  } else {
+    settleRow = `<div class="row"><span>Settlement</span><span class="pending">Settling on MST testnet…</span></div>`;
+  }
+  box.innerHTML = `<h3>Paid on MST testnet</h3>
+    <div class="row"><span>Locked in escrow before the job</span><span>${c.locked_amount} ${SYMBOL}, ${txLink(c.lock_url, c.lock_tx)}</span></div>
+    ${settleRow}`;
+  box.hidden = false;
+}
+
+async function pollChain(jobId) {
+  try {
+    const j = await api("/api/jobs/" + jobId);
+    renderChain(j.chain);
+    if (j.chain && (j.chain.status === "locked" || j.chain.status === "settling")) {
+      setTimeout(() => pollChain(jobId), 2000);
+    } else {
+      loadChain(); loadHistory();
+    }
+  } catch (e) { setTimeout(() => pollChain(jobId), 3000); }
+}
+
 /* ---------- jobs ---------- */
 async function runJob() {
+  if (submitting || currentJob) return;
+  submitting = true;
   $("runBtn").disabled = true;
   $("receipt").hidden = true;
-  setMsg("Finding a free GPU host…");
+  setMsg(CHAIN.enabled
+    ? "Locking " + CHAIN.lock_amount + " " + SYMBOL + " in escrow on MST testnet. This takes a few seconds…"
+    : "Finding a free GPU host…");
   try {
     const job = await api("/api/jobs", {
       method: "POST",
@@ -317,10 +397,14 @@ async function runJob() {
       body: JSON.stringify({ job_type: "mnist" })
     });
     currentJob = job.job_id;
+    submitting = false;
     jobSamples = [];
-    setMsg("Job " + job.job_id + " is running on " + job.host_id + ".");
+    setMsg("Job " + job.job_id + " is running on " + job.host_id + "." +
+      (CHAIN.enabled ? " Payment is locked in escrow." : ""));
+    loadChain();
     pollJob();
   } catch (e) {
+    submitting = false;
     setMsg(e.message, true);
     $("runBtn").disabled = false;
   }
@@ -340,7 +424,9 @@ async function pollJob() {
       setTimeout(pollJob, 1000);
     } else {
       showReceipt(j);
+      const finishedId = currentJob;
       currentJob = null;
+      if (j.chain && j.chain.status !== "off") pollChain(finishedId);
       setMsg(j.status === "finished" ? "Job finished. Receipt below." : "Job ended with status: " + j.status, j.status !== "finished");
       loadHistory();
     }
@@ -357,13 +443,14 @@ function showReceipt(j) {
   $("rId").textContent = j.job_id;
   $("rHost").textContent = "Ran on " + j.host_id + ". Peak GPU " + j.peak_util + "%, peak memory " + j.peak_mem_mb + " MB.";
   $("rWall").textContent = b.wall_seconds.toFixed(1) + " s";
-  $("rWallCost").textContent = "Would cost " + b.time_based_amount.toFixed(6) + " MSTC";
+  $("rWallCost").textContent = "Would cost " + b.time_based_amount.toFixed(6) + " " + SYMBOL;
   $("rVerified").textContent = b.verified_seconds + " s";
-  $("rBilled").textContent = "Billed " + b.billed_amount.toFixed(6) + " MSTC";
+  $("rBilled").textContent = "Billed " + b.billed_amount.toFixed(6) + " " + SYMBOL;
   $("rSaved").textContent = pct.toFixed(0) + "%";
   const done = (j.log_tail || []).find(l => l.startsWith("DONE:"));
   $("rResult").textContent = done ? "Model result: " + done.replace("DONE: ", "") : "No result line in the job log.";
   $("rLog").textContent = (j.log_tail || []).join("\n");
+  renderChain(j.chain);
   $("receipt").hidden = false;
 }
 
@@ -391,7 +478,7 @@ $("runBtn").addEventListener("click", runJob);
 window.addEventListener("resize", () => { drawChart(); drawTape(); });
 
 drawChart(); drawTape();
-pollHosts(); loadHistory();
+pollHosts(); loadHistory(); loadChain();
 setInterval(pollLive, 1000);
 setInterval(pollHosts, 3000);
 </script>

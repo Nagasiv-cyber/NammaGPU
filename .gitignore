@@ -8,3 +8,5 @@ __pycache__/
 step7_result.txt
 auto_pipeline.py
 auto_pipeline.log
+# NEVER upload this: it holds wallet private keys
+chain_config.json
