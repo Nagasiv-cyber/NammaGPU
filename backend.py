@@ -3,20 +3,24 @@ GPUSetu Marketplace Backend  —  runs on the Aspire Lite
 
 Start it with:
     python -m uvicorn backend:app --host 0.0.0.0 --port 9000
+Dashboard:  http://127.0.0.1:9000
 
-Then open the dashboard in a browser:  http://127.0.0.1:9000
-
-If chain_config.json exists and "enabled" is true, every job is paid on MST testnet:
-  lock payment in escrow -> run job -> settle for verified seconds.
-Otherwise it runs exactly like Phase 3 (billing shown, nothing on chain).
+Every job goes through:
+  1. PRICING AGENT   quotes a per-second price from recent demand
+  2. MATCHING        first idle, staked peer host  ->  else CLOUD FALLBACK
+  3. ESCROW          buyer's payment locked on MST before the GPU starts   (peer jobs)
+  4. METERING        GPU telemetry every second; only busy seconds count
+  5. ANOMALY AGENT   host's claim vs. telemetry  ->  SETTLE honestly, or SLASH a cheater
 """
 
 import json
+import os
 import threading
 import time
 import uuid
 import urllib.error
 import urllib.request
+from collections import deque
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -26,21 +30,47 @@ from pydantic import BaseModel
 # ---------------------------------------------------------------------------
 # 1. SETTINGS
 # ---------------------------------------------------------------------------
-# Every GPU host the marketplace knows about. Add more hosts here later.
+# The ALG's address depends on the network: 192.168.137.1 on the ALG's own hotspot,
+# something else on a phone hotspot. Override it at startup without editing code:
+#     set HOST_URL=http://192.168.43.25:8000      (Command Prompt)
+#     $env:HOST_URL = "http://192.168.43.25:8000"  (PowerShell)
 HOSTS = [
-    {"host_id": "acer-alg-rtx3050-6gb", "url": "http://192.168.137.1:8000"},
+    {"host_id": "acer-alg-rtx3050-6gb", "url": os.environ.get("HOST_URL", "http://192.168.137.1:8000")},
 ]
+print(f"Host daemon expected at {HOSTS[0]['url']}")
 
-RATE_PER_SEC = 0.001      # price per VERIFIED GPU-second (replaced by the contract's rate if chain is on)
+BASE_RATE = 0.001         # normal price per VERIFIED GPU-second
 SYMBOL = "MSTC"
-BUSY_THRESHOLD = 20       # same rule as the host: >= 20% utilization = real work
+BUSY_THRESHOLD = 20       # >= 20% GPU utilization in a second = real work
 TIMEOUT = 3               # seconds to wait for a host before calling it offline
 
+# Anomaly agent: slashing is for LYING, not for slow starts.
+# Billing already pays only verified seconds, so idle startup time (5 s natively, 10-15 s
+# inside a Docker sandbox) costs the host, not the buyer. Fraud = claiming work that the
+# telemetry shows mostly never happened.
+FRAUD_MIN_VERIFIED_SHARE = 0.5   # telemetry must back at least half of the claimed time
+FRAUD_MIN_CLAIM = 10             # ignore tiny jobs, too short to judge
+
+# Pricing agent: demand = job requests in the last 10 minutes.
+DEMAND_WINDOW = 600
+PRICE_TIERS = [           # (at least this many recent requests, multiplier, label)
+    (6, 1.5, "high demand"),
+    (3, 1.25, "rising demand"),
+    (0, 1.0, "normal demand"),
+]
+
+# Cloud fallback (SIMULATED): what a Vast.ai / RunPod API call would give us.
+CLOUD_PROVIDER = "Vast.ai-style cloud (simulated)"
+CLOUD_SPINUP = 3          # seconds to "start an instance"
+CLOUD_RUN = 15            # seconds the simulated job runs
+CLOUD_WHOLESALE_SHARE = 0.75   # we pay the provider 75% of the buyer's price; 25% is our margin
+
 BASE_DIR = Path(__file__).parent
-jobs = {}                 # the marketplace's job book
-settle_guard = threading.Lock()   # makes sure a job is settled exactly once
-match_guard = threading.Lock()    # two requests can't grab the same host at once
-reserved = set()                  # hosts promised to a job that is still being set up
+jobs = {}                               # the marketplace's job book
+request_log = deque(maxlen=500)         # times of recent job requests (for the pricing agent)
+settle_guard = threading.Lock()         # a job is settled or slashed exactly once
+match_guard = threading.Lock()          # two requests can't grab the same host at once
+reserved = set()                        # hosts promised to a job still being set up
 
 # ---------------------------------------------------------------------------
 # 2. BLOCKCHAIN (optional)
@@ -48,18 +78,22 @@ reserved = set()                  # hosts promised to a job that is still being 
 chain = None
 chain_error = None
 LOCK_AMOUNT = 0
+MIN_STAKE = 0
+onchain_rate = None
 
 try:
     from chain import Chain, load_config
     _cfg = load_config()
     if _cfg and _cfg.get("enabled") and _cfg.get("contract_address"):
         chain = Chain(_cfg)
-        RATE_PER_SEC = chain.rate_per_sec()
+        BASE_RATE = _cfg.get("rate_per_sec", BASE_RATE)
+        onchain_rate = chain.rate_per_sec()
+        MIN_STAKE = chain.min_stake()
         SYMBOL = _cfg.get("symbol", "tMSTC")
         LOCK_AMOUNT = _cfg["lock_amount"]
         for h in HOSTS:                      # demo: the one host uses the "host" test wallet
             h.setdefault("wallet", chain.address("host"))
-        print(f"Chain ON: contract {_cfg['contract_address']}, rate {RATE_PER_SEC} {SYMBOL}/sec")
+        print(f"Chain ON: contract {_cfg['contract_address']}, on-chain rate {onchain_rate} {SYMBOL}/sec")
     else:
         print("Chain OFF: no chain_config.json, not enabled, or no contract deployed yet.")
 except Exception as e:                      # never let chain problems stop the marketplace
@@ -72,19 +106,17 @@ except Exception as e:                      # never let chain problems stop the 
 # 3. TALKING TO HOSTS
 # ---------------------------------------------------------------------------
 def host_call(host, path, method="GET", body=None):
-    """Send one request to a host daemon and return its JSON answer."""
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(
-        host["url"] + path, data=data, method=method,
-        headers={"Content-Type": "application/json"},
-    )
+    req = urllib.request.Request(host["url"] + path, data=data, method=method,
+                                 headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
         return json.loads(r.read())
 
 
 def host_status(host):
     """Ask a host 'are you alive and free?' One retry, so a single slow reply isn't 'offline'."""
-    for attempt in range(2):
+    last_error = None
+    for _ in range(2):
         try:
             info = host_call(host, "/")
             return {"host_id": host["host_id"], "url": host["url"],
@@ -95,52 +127,92 @@ def host_status(host):
     return {"host_id": host["host_id"], "url": host["url"], "gpu": None, "status": "offline"}
 
 
+def host_deposit_status(host):
+    """'ok' | 'slashed' (no deposit: may not take jobs) | 'unknown' (couldn't reach MST to check)."""
+    if chain is None:
+        return "ok"
+    try:
+        return "ok" if chain.host_stake(host["wallet"]) >= MIN_STAKE else "slashed"
+    except Exception as e:
+        print(f"Could not read {host['host_id']}'s deposit from MST testnet: {e}")
+        return "unknown"
+
+
 def find_host(host_id):
-    for h in HOSTS:
-        if h["host_id"] == host_id:
-            return h
-    return None
+    return next((h for h in HOSTS if h["host_id"] == host_id), None)
 
 
 # ---------------------------------------------------------------------------
-# 4. BILLING — the heart of GPUSetu
+# 4. PRICING AGENT — rule-based surge pricing
 # ---------------------------------------------------------------------------
-def make_bill(host_job):
+def pricing_agent():
+    now = time.time()
+    recent = sum(1 for t in request_log if now - t < DEMAND_WINDOW)
+    for threshold, multiplier, label in PRICE_TIERS:
+        if recent >= threshold:
+            rate = round(BASE_RATE * multiplier, 6)
+            return {"rate_per_sec": rate, "multiplier": multiplier, "recent_requests": recent,
+                    "reason": f"{recent} job requests in the last 10 min: {label} ({multiplier}x base price)"}
+
+
+def apply_price_on_chain(rate):
+    """Change the contract's price only when the tier changes (each change is a transaction)."""
+    global onchain_rate
+    if chain is not None and rate != onchain_rate:
+        chain.set_rate(rate)
+        onchain_rate = rate
+
+
+# ---------------------------------------------------------------------------
+# 5. BILLING + ANOMALY AGENT
+# ---------------------------------------------------------------------------
+def make_bill(host_job, rate):
     """Charge only for seconds where the GPU was measurably working."""
     samples = host_job.get("samples", [])
     verified = sum(1 for s in samples if s["gpu_util"] >= BUSY_THRESHOLD)
     if host_job.get("status") != "running" and "busy_seconds" in host_job:
-        verified = host_job["busy_seconds"]          # final number from the host
-
+        verified = host_job["busy_seconds"]
     if host_job.get("status") == "running":
-        # Use the HOST's clock for both times. The two laptops' clocks can differ.
         wall = (samples[-1]["time"] - host_job["started_at"]) if samples else 0
     else:
         wall = host_job.get("runtime_s", 0)
-
-    # Safety rule: you can never be billed for more seconds than the job actually ran.
-    verified = min(verified, int(wall))
-
+    verified = min(verified, int(wall))      # never bill more seconds than the job ran
     return {
-        "rate_per_sec": RATE_PER_SEC,
+        "rate_per_sec": rate,
         "symbol": SYMBOL,
         "wall_seconds": round(wall, 1),
         "verified_seconds": verified,
-        "billed_amount": round(verified * RATE_PER_SEC, 6),
-        "time_based_amount": round(wall * RATE_PER_SEC, 6),   # what time-based billing would charge
+        "billed_amount": round(verified * rate, 6),
+        "time_based_amount": round(wall * rate, 6),
     }
 
 
+def anomaly_agent(host_job, bill):
+    """Compare what the host CLAIMS against what the GPU telemetry SHOWS."""
+    claimed = host_job.get("claimed_seconds", int(bill["wall_seconds"]))
+    verified = bill["verified_seconds"]
+    share = verified / claimed if claimed else 1.0
+    if claimed >= FRAUD_MIN_CLAIM and share < FRAUD_MIN_VERIFIED_SHARE:
+        return {"verdict": "fraud", "claimed_seconds": claimed, "verified_seconds": verified,
+                "reason": f"Host claimed {claimed} s of GPU work, but the telemetry backs only "
+                          f"{verified} s ({share:.0%}). Below the {FRAUD_MIN_VERIFIED_SHARE:.0%} "
+                          f"minimum, so the claim is treated as false."}
+    return {"verdict": "honest", "claimed_seconds": claimed, "verified_seconds": verified,
+            "reason": f"Telemetry backs {verified} s of the {claimed} s claimed ({share:.0%}). "
+                      f"The other {claimed - verified} s were startup, which is never billed."}
+
+
 # ---------------------------------------------------------------------------
-# 5. SETTLEMENT ON CHAIN (runs in the background so the dashboard never freezes)
+# 6. ON-CHAIN SETTLEMENT (background, so the dashboard never freezes)
 # ---------------------------------------------------------------------------
 def settle_in_background(job_id, verified_seconds):
     job = jobs[job_id]
+    rate = job.get("rate", BASE_RATE)
 
     def work():
         try:
             tx = chain.settle(job_id, verified_seconds)
-            paid = round(min(verified_seconds * RATE_PER_SEC, LOCK_AMOUNT), 6)
+            paid = round(min(verified_seconds * rate, LOCK_AMOUNT), 6)
             job["chain"].update(status="settled", settle_tx=tx, settle_url=chain.tx_url(tx),
                                 paid_to_host=paid, refunded_to_buyer=round(LOCK_AMOUNT - paid, 6))
         except Exception as e:
@@ -150,14 +222,96 @@ def settle_in_background(job_id, verified_seconds):
     threading.Thread(target=work, daemon=True).start()
 
 
+def slash_in_background(job_id, reason):
+    job = jobs[job_id]
+
+    def work():
+        try:
+            penalty = chain.host_stake(chain.address("host"))
+            tx = chain.slash(job_id, reason[:200])
+            job["chain"].update(status="slashed", slash_tx=tx, slash_url=chain.tx_url(tx),
+                                paid_to_host=0, refunded_to_buyer=LOCK_AMOUNT,
+                                penalty_to_buyer=round(penalty, 6))
+        except Exception as e:
+            job["chain"].update(status="failed", error=f"Slash failed: {e}")
+
+    job["chain"]["status"] = "slashing"
+    threading.Thread(target=work, daemon=True).start()
+
+
 # ---------------------------------------------------------------------------
-# 6. WEB SERVER
+# 7. STARTING JOBS: peer host, or cloud fallback
+# ---------------------------------------------------------------------------
+def start_on_host(h, req, quote):
+    """Lock payment, then start the job on host h (already reserved for us)."""
+    job_id = uuid.uuid4().hex[:8]
+    chain_info = {"status": "off"}
+
+    if chain is not None:
+        try:
+            apply_price_on_chain(quote["rate_per_sec"])
+            lock_tx = chain.lock_payment(job_id, h["wallet"], LOCK_AMOUNT)
+        except Exception as e:
+            raise HTTPException(502, f"Could not lock payment on MST testnet: {e}")
+        chain_info = {"status": "locked", "locked_amount": LOCK_AMOUNT,
+                      "lock_tx": lock_tx, "lock_url": chain.tx_url(lock_tx)}
+
+    try:
+        started = host_call(h, "/run-job", "POST", {"job_type": req.job_type})
+    except Exception as e:
+        if chain is not None:                    # job never ran -> buyer gets everything back
+            jobs[job_id] = {"job_id": job_id, "chain": chain_info, "rate": quote["rate_per_sec"]}
+            settle_in_background(job_id, 0)
+        raise HTTPException(502, f"Payment was locked but the host did not start the job ({e}). "
+                                 "The payment is being refunded.")
+
+    jobs[job_id] = {
+        "job_id": job_id, "job_type": req.job_type, "host_id": h["host_id"],
+        "host_job_id": started["job_id"], "source": "peer",
+        "submitted_at": round(time.time(), 2), "rate": quote["rate_per_sec"],
+        "pricing": quote, "chain": chain_info,
+    }
+    return jobs[job_id]
+
+
+def start_on_cloud(req, quote, why):
+    """SIMULATED cloud fallback: stands in for a Vast.ai / RunPod API call."""
+    job_id = uuid.uuid4().hex[:8]
+    jobs[job_id] = {
+        "job_id": job_id, "job_type": req.job_type, "host_id": CLOUD_PROVIDER,
+        "source": "cloud", "fallback_reason": why,
+        "submitted_at": round(time.time(), 2), "rate": quote["rate_per_sec"],
+        "pricing": quote, "chain": {"status": "off"},
+    }
+    return jobs[job_id]
+
+
+def cloud_detail(job):
+    elapsed = time.time() - job["submitted_at"]
+    running = elapsed < CLOUD_SPINUP + CLOUD_RUN
+    billed = 0 if elapsed < CLOUD_SPINUP else int(min(elapsed - CLOUD_SPINUP, CLOUD_RUN))
+    rate = job["rate"]
+    job["status"] = "running" if running else "finished"
+    job["bill"] = {"rate_per_sec": rate, "symbol": SYMBOL, "wall_seconds": round(min(elapsed, CLOUD_SPINUP + CLOUD_RUN), 1),
+                   "verified_seconds": billed, "billed_amount": round(billed * rate, 6),
+                   "time_based_amount": round(billed * rate, 6),
+                   "provider_cost": round(billed * rate * CLOUD_WHOLESALE_SHARE, 6),
+                   "margin": round(billed * rate * (1 - CLOUD_WHOLESALE_SHARE), 6)}
+    return {**job, "samples": [], "log_tail": [
+        f"Fallback: {job['fallback_reason']}",
+        f"Provider: {CLOUD_PROVIDER}. Instance started in {CLOUD_SPINUP} s.",
+        "Billed by the provider's per-second meter (no peer telemetry for cloud jobs).",
+    ] + (["DONE: cloud session finished"] if not running else [])}
+
+
+# ---------------------------------------------------------------------------
+# 8. WEB SERVER
 # ---------------------------------------------------------------------------
 app = FastAPI(title="GPUSetu Marketplace")
 
 
 class JobRequest(BaseModel):
-    job_type: str = "mnist"
+    job_type: str = "mnist"      # "fake" = fraud demo (cheating host)
 
 
 @app.get("/")
@@ -172,7 +326,6 @@ def list_hosts():
 
 @app.get("/api/live")
 def live():
-    """Live GPU reading from the first reachable host (for the dashboard graph)."""
     for h in HOSTS:
         try:
             reading = host_call(h, "/stats")
@@ -183,19 +336,21 @@ def live():
     raise HTTPException(503, "No host reachable. Check the hotspot and that the host daemon is running.")
 
 
+@app.get("/api/pricing")
+def pricing():
+    return {**pricing_agent(), "symbol": SYMBOL, "base_rate": BASE_RATE}
+
+
 @app.get("/api/chain")
 def chain_info():
-    """Is on-chain payment on, and what are the wallet balances right now?"""
     if chain is None:
         return {"enabled": False, "symbol": SYMBOL, "error": chain_error}
     try:
         host_wallet = chain.address("host")
         return {
-            "enabled": True,
-            "symbol": SYMBOL,
+            "enabled": True, "symbol": SYMBOL,
             "contract": chain.cfg["contract_address"],
-            "rate_per_sec": RATE_PER_SEC,
-            "lock_amount": LOCK_AMOUNT,
+            "rate_per_sec": onchain_rate, "lock_amount": LOCK_AMOUNT, "min_stake": MIN_STAKE,
             "buyer_balance": round(chain.balance("buyer"), 6),
             "host_balance": round(chain.balance("host"), 6),
             "host_stake": round(chain.host_stake(host_wallet), 6),
@@ -206,54 +361,32 @@ def chain_info():
 
 @app.post("/api/jobs")
 def submit_job(req: JobRequest):
-    """MATCHING: pick the first idle host, lock payment, then start the job."""
+    """PRICING -> MATCHING -> (peer + escrow) or (cloud fallback)."""
+    quote = pricing_agent()
+    request_log.append(time.time())
+
+    reasons = []
     for h in HOSTS:
         with match_guard:
-            if h["host_id"] in reserved or host_status(h)["status"] != "idle":
+            status = "reserved" if h["host_id"] in reserved else host_status(h)["status"]
+            if status == "idle":
+                deposit = host_deposit_status(h)
+                if deposit == "slashed":
+                    status = "suspended (deposit slashed, must re-stake)"
+                elif deposit == "unknown":
+                    status = "unverified (MST testnet unreachable, so its deposit can't be checked)"
+            if status != "idle":
+                reasons.append(f"{h['host_id']} is {status}")
                 continue
-            reserved.add(h["host_id"])     # claim it before the slow payment step
+            reserved.add(h["host_id"])           # claim it before the slow payment step
         try:
-            return start_on_host(h, req)
+            return start_on_host(h, req, quote)
         finally:
             reserved.discard(h["host_id"])
 
-    raise HTTPException(503, "Every host is busy or offline. The cloud fallback arrives in Phase 5.")
-
-
-def start_on_host(h, req):
-    """Lock payment, then start the job on host h (which is already reserved for us)."""
-    job_id = uuid.uuid4().hex[:8]
-    chain_info_for_job = {"status": "off"}
-
-    # Step 1: lock the buyer's payment in escrow BEFORE any GPU work starts.
-    if chain is not None:
-        try:
-            lock_tx = chain.lock_payment(job_id, h["wallet"], LOCK_AMOUNT)
-        except Exception as e:
-            raise HTTPException(502, f"Could not lock payment on MST testnet: {e}")
-        chain_info_for_job = {"status": "locked", "locked_amount": LOCK_AMOUNT,
-                              "lock_tx": lock_tx, "lock_url": chain.tx_url(lock_tx)}
-
-    # Step 2: start the job on the host.
-    try:
-        started = host_call(h, "/run-job", "POST", {"job_type": req.job_type})
-    except Exception as e:
-        if chain is not None:                # job never ran -> give the buyer everything back
-            jobs[job_id] = {"job_id": job_id, "chain": chain_info_for_job}
-            settle_in_background(job_id, 0)
-        raise HTTPException(502, f"Payment was locked but the host did not start the job ({e}). "
-                                 "The payment is being refunded.")
-
-    jobs[job_id] = {
-        "job_id": job_id,
-        "job_type": req.job_type,
-        "host_id": h["host_id"],
-        "host_job_id": started["job_id"],
-        "source": "peer",             # Phase 5 adds "cloud" for the fallback
-        "submitted_at": round(time.time(), 2),
-        "chain": chain_info_for_job,
-    }
-    return jobs[job_id]
+    if req.job_type == "fake":
+        raise HTTPException(503, "The fraud demo needs the peer host: " + "; ".join(reasons))
+    return start_on_cloud(req, quote, "; ".join(reasons) or "no peer hosts registered")
 
 
 @app.get("/api/jobs/{job_id}")
@@ -261,21 +394,29 @@ def job_detail(job_id: str):
     job = jobs.get(job_id)
     if not job or "host_id" not in job:
         raise HTTPException(404, "No such job")
+    if job["source"] == "cloud":
+        return cloud_detail(job)
+
     host = find_host(job["host_id"])
     try:
         host_job = host_call(host, f"/job/{job['host_job_id']}")
     except Exception:
         raise HTTPException(502, "Lost contact with the host running this job.")
 
-    bill = make_bill(host_job)
-    job["status"] = host_job["status"]      # remember the latest state for the history list
+    bill = make_bill(host_job, job["rate"])
+    job["status"] = host_job["status"]
     job["bill"] = bill
 
-    # Step 3: once the job is over, settle on chain exactly once.
     if host_job["status"] != "running":
+        job.setdefault("audit", anomaly_agent(host_job, bill))
+        if job["audit"]["verdict"] == "fraud":
+            bill["billed_amount"] = 0                # a caught cheater earns nothing
         with settle_guard:
             if job["chain"].get("status") == "locked":
-                settle_in_background(job_id, bill["verified_seconds"])
+                if job["audit"]["verdict"] == "fraud":
+                    slash_in_background(job_id, job["audit"]["reason"])
+                else:
+                    settle_in_background(job_id, bill["verified_seconds"])
 
     return {
         **job,
@@ -283,6 +424,7 @@ def job_detail(job_id: str):
         "samples": host_job.get("samples", []),
         "peak_util": host_job.get("peak_util"),
         "peak_mem_mb": host_job.get("peak_mem_mb"),
+        "sandbox": host_job.get("sandbox", "none"),
         "log_tail": host_job.get("log_tail", []),
         "bill": bill,
     }
@@ -290,5 +432,8 @@ def job_detail(job_id: str):
 
 @app.get("/api/jobs")
 def job_history():
+    for j in jobs.values():
+        if j.get("source") == "cloud" and j.get("status") != "finished":
+            cloud_detail(j)                      # bring finished cloud jobs up to date
     return sorted([j for j in jobs.values() if "host_id" in j],
                   key=lambda j: j["submitted_at"], reverse=True)

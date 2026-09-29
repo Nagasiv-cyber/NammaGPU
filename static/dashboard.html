@@ -116,6 +116,24 @@
   .wallets { font-size: 13px; color: #AEB8C4; margin-top: 14px; padding-top: 12px; border-top: 1px solid #33405A; }
   .wallets b { color: #F4F6F8; font-family: var(--num); font-weight: 600; }
 
+  button.secondary { background: var(--surface); color: var(--danger); border: 1.5px solid var(--danger); }
+  button.secondary:hover { background: #FBEDEC; }
+  button.secondary:disabled { background: var(--surface); color: var(--idle); border-color: var(--idle); }
+  .price-why { font-size: 12px; color: #AEB8C4; margin-top: 8px; }
+  .verdict { border-radius: 6px; padding: 12px 14px; margin: 12px 0 4px; font-size: 14px; }
+  .verdict b { display: block; font-size: 15px; margin-bottom: 2px; }
+  .verdict.honest { background: #EAF4EE; border: 1px solid #B9DBC6; }
+  .verdict.honest b { color: var(--ok); }
+  .verdict.fraud { background: #FBEDEC; border: 1px solid #EDBDB9; }
+  .verdict.fraud b { color: var(--danger); }
+  .verdict.cloud { background: #EEF2F7; border: 1px solid var(--line); }
+  .verdict.cloud b { color: var(--gpu); }
+  .kpi { font-size: 14px; color: var(--muted); margin: -4px 0 10px; }
+  .kpi b { color: var(--ink); font-family: var(--num); }
+  .tag { font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 999px; background: var(--bg); }
+  .tag.fraud { background: #FBEDEC; color: var(--danger); }
+  .tag.cloud { background: #EEF2F7; color: var(--gpu); }
+
   table { width: 100%; border-collapse: collapse; font-size: 14px; }
   th { text-align: left; font-weight: 600; color: var(--muted); padding: 8px 6px; border-bottom: 1px solid var(--line); }
   td { padding: 8px 6px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
@@ -155,26 +173,29 @@
       <div class="amount"><span id="mAmount">0.000000</span> <span class="sym">MSTC</span></div>
       <dl>
         <dt>Time on host</dt><dd id="mWall">0.0 s</dd>
-        <dt>Rate</dt><dd id="mRate">0.001 MSTC / verified sec</dd>
+        <dt>Price now</dt><dd id="mRate">0.001 MSTC / verified sec</dd>
         <dt>GPU now</dt><dd id="mUtil">–</dd>
         <dt>GPU memory</dt><dd id="mMem">–</dd>
         <dt>Temperature</dt><dd id="mTemp">–</dd>
       </dl>
+      <div class="price-why" id="mPriceWhy"></div>
       <div class="wallets" id="wallets" hidden></div>
     </section>
   </div>
 
   <div class="actions">
     <button id="runBtn">Run training job</button>
+    <button id="cheatBtn" class="secondary" title="Fraud demo: the host fakes the work and claims full payment">Simulate cheating host</button>
     <span id="msg">Trains a handwriting-recognition model on the host's GPU for about 30 seconds.</span>
   </div>
 
   <section class="panel receipt" id="receipt" hidden>
     <h2>Receipt for job <span id="rId"></span></h2>
     <p class="hint" id="rHost"></p>
+    <div class="verdict" id="rVerdict" hidden></div>
     <div class="compare">
       <div>
-        <div class="k">Time on host</div>
+        <div class="k" id="rWallLabel">Time on host</div>
         <div class="v" id="rWall"></div>
         <div class="s" id="rWallCost"></div>
       </div>
@@ -196,8 +217,9 @@
 
   <section class="panel">
     <h2>Job history</h2>
+    <p class="kpi" id="kpi"></p>
     <table>
-      <thead><tr><th>Job</th><th>Host</th><th>Status</th><th class="num">Verified sec</th><th class="num">Billed (<span class="sym">MSTC</span>)</th></tr></thead>
+      <thead><tr><th>Job</th><th>Served by</th><th>Result</th><th class="num">Verified sec</th><th class="num">Billed (<span class="sym">MSTC</span>)</th></tr></thead>
       <tbody id="history"></tbody>
     </table>
     <div class="empty" id="historyEmpty">No jobs yet. Run a training job to see it here.</div>
@@ -211,7 +233,8 @@ const WINDOW = 60;           // seconds of history shown on the graph
 const live = [];             // rolling list of GPU readings
 let currentJob = null;
 let liveFailures = 0;
-let submitting = false;      // true while a job request is on its way (payment locking)        // only show "unreachable" after several misses in a row
+let submitting = false;
+let tapeNote = "Billing tape: one block per second of the current job";      // true while a job request is on its way (payment locking)        // only show "unreachable" after several misses in a row
 let SYMBOL = "MSTC";
 let CHAIN = { enabled: false };
 let jobSamples = [];
@@ -277,7 +300,7 @@ function drawTape() {
   if (!jobSamples.length) {
     ctx.fillStyle = css("--muted");
     ctx.font = "13px Segoe UI, system-ui, sans-serif";
-    ctx.fillText("Billing tape: one block per second of the current job", 0, h / 2 + 4);
+    ctx.fillText(tapeNote, 0, h / 2 + 4);
     return;
   }
   const n = Math.max(jobSamples.length, 40);
@@ -312,7 +335,9 @@ async function pollHosts() {
     const h = hosts[0];
     setHost(h.gpu || h.host_id, h.status,
       h.status === "offline" ? "Host unreachable" : (h.status === "busy" ? "Running a job" : "Idle, ready for work"));
-    if (!currentJob && !submitting) $("runBtn").disabled = h.status !== "idle";
+    const suspended = CHAIN.enabled && CHAIN.host_stake !== undefined && CHAIN.host_stake < CHAIN.min_stake;
+    if (suspended && h.status !== "offline") setHost(h.gpu || h.host_id, "offline", "Suspended: deposit slashed");
+    setButtons();
   } catch (e) {
     setHost(null, "offline", "Marketplace backend not responding");
   }
@@ -324,18 +349,28 @@ function setHost(name, status, text) {
   $("hostState").textContent = text;
 }
 
+/* ---------- pricing agent ---------- */
+async function loadPricing() {
+  try {
+    const p = await api("/api/pricing");
+    $("mRate").textContent = p.rate_per_sec + " " + (p.symbol || SYMBOL) + " / verified sec";
+    $("mPriceWhy").textContent = "Pricing agent: " + p.reason;
+  } catch (e) { /* optional */ }
+}
+
 /* ---------- blockchain ---------- */
 async function loadChain() {
   try {
     CHAIN = await api("/api/chain");
     SYMBOL = CHAIN.symbol || SYMBOL;
     document.querySelectorAll(".sym").forEach(el => el.textContent = SYMBOL);
-    if (CHAIN.rate_per_sec) $("mRate").textContent = CHAIN.rate_per_sec + " " + SYMBOL + " / verified sec";
     const w = $("wallets");
     if (CHAIN.enabled && CHAIN.buyer_balance !== undefined) {
+      const suspended = CHAIN.host_stake < CHAIN.min_stake;
       w.innerHTML = "Buyer wallet <b>" + CHAIN.buyer_balance.toFixed(4) + "</b> " + SYMBOL +
         "<br>Host wallet <b>" + CHAIN.host_balance.toFixed(4) + "</b> " + SYMBOL +
-        "<br>Host security deposit <b>" + CHAIN.host_stake.toFixed(4) + "</b> " + SYMBOL;
+        "<br>Host security deposit <b>" + CHAIN.host_stake.toFixed(4) + "</b> " + SYMBOL +
+        (suspended ? " <b style='color:#F2A19A'>(slashed: host suspended)</b>" : "");
       w.hidden = false;
     } else if (CHAIN.enabled && CHAIN.error) {
       w.textContent = CHAIN.error;
@@ -358,6 +393,13 @@ function renderChain(c) {
     settleRow = `<div class="row"><span>Settlement</span><span>${txLink(c.settle_url, c.settle_tx)}</span></div>
       <div class="row"><span>Paid to host</span><span>${c.paid_to_host} ${SYMBOL}</span></div>
       <div class="row"><span>Refunded to buyer</span><span>${c.refunded_to_buyer} ${SYMBOL}</span></div>`;
+  } else if (c.status === "slashed") {
+    settleRow = `<div class="row"><span>Slash (host caught cheating)</span><span>${txLink(c.slash_url, c.slash_tx)}</span></div>
+      <div class="row"><span>Paid to host</span><span class="bad">0 ${SYMBOL}</span></div>
+      <div class="row"><span>Refunded to buyer</span><span>${c.refunded_to_buyer} ${SYMBOL}</span></div>
+      <div class="row"><span>Host deposit given to buyer as compensation</span><span>${c.penalty_to_buyer} ${SYMBOL}</span></div>`;
+  } else if (c.status === "slashing") {
+    settleRow = `<div class="row"><span>Slash</span><span class="pending">Taking the host's deposit on MST testnet…</span></div>`;
   } else if (c.status === "failed") {
     settleRow = `<div class="row"><span>Settlement</span><span class="bad">${c.error}</span></div>`;
   } else {
@@ -373,7 +415,7 @@ async function pollChain(jobId) {
   try {
     const j = await api("/api/jobs/" + jobId);
     renderChain(j.chain);
-    if (j.chain && (j.chain.status === "locked" || j.chain.status === "settling")) {
+    if (j.chain && ["locked", "settling", "slashing"].includes(j.chain.status)) {
       setTimeout(() => pollChain(jobId), 2000);
     } else {
       loadChain(); loadHistory();
@@ -382,10 +424,16 @@ async function pollChain(jobId) {
 }
 
 /* ---------- jobs ---------- */
-async function runJob() {
+function setButtons() {
+  const busy = submitting || currentJob;
+  $("runBtn").disabled = !!busy;
+  $("cheatBtn").disabled = !!busy;
+}
+
+async function runJob(jobType) {
   if (submitting || currentJob) return;
   submitting = true;
-  $("runBtn").disabled = true;
+  setButtons();
   $("receipt").hidden = true;
   setMsg(CHAIN.enabled
     ? "Locking " + CHAIN.lock_amount + " " + SYMBOL + " in escrow on MST testnet. This takes a few seconds…"
@@ -394,19 +442,24 @@ async function runJob() {
     const job = await api("/api/jobs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ job_type: "mnist" })
+      body: JSON.stringify({ job_type: jobType })
     });
     currentJob = job.job_id;
     submitting = false;
     jobSamples = [];
-    setMsg("Job " + job.job_id + " is running on " + job.host_id + "." +
-      (CHAIN.enabled ? " Payment is locked in escrow." : ""));
-    loadChain();
+    if (job.source === "cloud") {
+      setMsg("No peer GPU available (" + job.fallback_reason + "). Sent to cloud fallback instead.");
+    } else {
+      setMsg("Job " + job.job_id + " is running on " + job.host_id + "." +
+        (CHAIN.enabled ? " Payment is locked in escrow." : "") +
+        (jobType === "fake" ? " (Fraud demo: this host will fake the work.)" : ""));
+    }
+    loadChain(); loadPricing(); setButtons();
     pollJob();
   } catch (e) {
     submitting = false;
     setMsg(e.message, true);
-    $("runBtn").disabled = false;
+    setButtons();
   }
 }
 
@@ -415,6 +468,9 @@ async function pollJob() {
   try {
     const j = await api("/api/jobs/" + currentJob);
     jobSamples = j.samples;
+    tapeNote = j.source === "cloud"
+      ? "Cloud job: billed by the provider's meter, no peer GPU telemetry"
+      : "Billing tape: one block per second of the current job";
     const b = j.bill;
     $("mVerified").textContent = b.verified_seconds;
     $("mAmount").textContent = b.billed_amount.toFixed(6);
@@ -426,8 +482,12 @@ async function pollJob() {
       showReceipt(j);
       const finishedId = currentJob;
       currentJob = null;
+      setButtons();
       if (j.chain && j.chain.status !== "off") pollChain(finishedId);
-      setMsg(j.status === "finished" ? "Job finished. Receipt below." : "Job ended with status: " + j.status, j.status !== "finished");
+      const fraud = j.audit && j.audit.verdict === "fraud";
+      setMsg(fraud ? "Fraud detected. The host is being slashed. Receipt below."
+        : (j.status === "finished" ? "Job finished. Receipt below." : "Job ended with status: " + j.status),
+        fraud || j.status !== "finished");
       loadHistory();
     }
   } catch (e) {
@@ -441,14 +501,33 @@ function showReceipt(j) {
   const saved = b.time_based_amount - b.billed_amount;
   const pct = b.time_based_amount > 0 ? Math.max(0, (saved / b.time_based_amount) * 100) : 0;
   $("rId").textContent = j.job_id;
-  $("rHost").textContent = "Ran on " + j.host_id + ". Peak GPU " + j.peak_util + "%, peak memory " + j.peak_mem_mb + " MB.";
+  $("rHost").textContent = j.source === "cloud"
+    ? "Served by " + j.host_id + " at " + j.rate + " " + SYMBOL + "/sec."
+    : "Ran on " + j.host_id + " at " + j.rate + " " + SYMBOL + "/sec. Peak GPU " + j.peak_util + "%, peak memory " + j.peak_mem_mb + " MB." +
+      (j.sandbox === "docker" ? " Ran inside a sealed Docker sandbox: no network, read-only files, limited memory." : "");
+  const v = $("rVerdict");
+  if (j.source === "cloud") {
+    v.className = "verdict cloud";
+    v.innerHTML = "<b>Cloud fallback</b>" + j.fallback_reason + ". Provider cost " + b.provider_cost +
+      " " + SYMBOL + ", marketplace margin " + b.margin + " " + SYMBOL +
+      ". Simulated provider; not settled on-chain in this prototype.";
+    v.hidden = false;
+  } else if (j.audit) {
+    v.className = "verdict " + j.audit.verdict;
+    v.innerHTML = (j.audit.verdict === "fraud" ? "<b>Fraud detected: host slashed</b>" : "<b>Anomaly check passed</b>") + j.audit.reason;
+    v.hidden = false;
+  } else { v.hidden = true; }
+  $("rWallLabel").textContent = j.source === "cloud" ? "Time on cloud instance" : "Time on host";
   $("rWall").textContent = b.wall_seconds.toFixed(1) + " s";
   $("rWallCost").textContent = "Would cost " + b.time_based_amount.toFixed(6) + " " + SYMBOL;
   $("rVerified").textContent = b.verified_seconds + " s";
   $("rBilled").textContent = "Billed " + b.billed_amount.toFixed(6) + " " + SYMBOL;
   $("rSaved").textContent = pct.toFixed(0) + "%";
   const done = (j.log_tail || []).find(l => l.startsWith("DONE:"));
-  $("rResult").textContent = done ? "Model result: " + done.replace("DONE: ", "") : "No result line in the job log.";
+  const cheated = j.audit && j.audit.verdict === "fraud";
+  $("rResult").textContent = !done ? "No result line in the job log."
+    : cheated ? "Result the host reported (not trusted: the GPU telemetry does not back up this work): " + done.replace("DONE: ", "")
+    : "Model result: " + done.replace("DONE: ", "");
   $("rLog").textContent = (j.log_tail || []).join("\n");
   renderChain(j.chain);
   $("receipt").hidden = false;
@@ -458,14 +537,25 @@ async function loadHistory() {
   try {
     const list = await api("/api/jobs");
     $("historyEmpty").hidden = list.length > 0;
-    $("history").innerHTML = list.map(j => `
+    const done = list.filter(j => j.status && j.status !== "running");
+    const peer = done.filter(j => j.source === "peer").length;
+    $("kpi").innerHTML = done.length
+      ? "Served by peer GPUs: <b>" + peer + " of " + done.length + "</b> jobs (" + Math.round(100 * peer / done.length) + "%)" + (peer < done.length ? ", the rest by cloud fallback." : ".")
+      : "";
+    $("history").innerHTML = list.map(j => {
+      const fraud = j.audit && j.audit.verdict === "fraud";
+      const result = !j.status || j.status === "running" ? "running"
+        : fraud ? '<span class="tag fraud">fraud, slashed</span>'
+        : j.source === "cloud" ? '<span class="tag cloud">cloud fallback</span>'
+        : j.status;
+      return `
       <tr>
         <td>${j.job_id}</td>
         <td>${j.host_id}</td>
-        <td>${j.status || "running"}</td>
+        <td>${result}</td>
         <td class="num">${j.bill ? j.bill.verified_seconds : "–"}</td>
         <td class="num">${j.bill ? j.bill.billed_amount.toFixed(6) : "–"}</td>
-      </tr>`).join("");
+      </tr>`; }).join("");
   } catch (e) { /* history is optional */ }
 }
 
@@ -474,11 +564,14 @@ function setMsg(text, isError) {
   $("msg").className = isError ? "error" : "";
 }
 
-$("runBtn").addEventListener("click", runJob);
+$("runBtn").addEventListener("click", () => runJob("mnist"));
+$("cheatBtn").addEventListener("click", () => runJob("fake"));
 window.addEventListener("resize", () => { drawChart(); drawTape(); });
 
 drawChart(); drawTape();
-pollHosts(); loadHistory(); loadChain();
+pollHosts(); loadHistory(); loadChain(); loadPricing();
+setInterval(loadPricing, 5000);
+setInterval(loadChain, 8000);      // picks up re-staking, balances and slashes without a page refresh
 setInterval(pollLive, 1000);
 setInterval(pollHosts, 3000);
 </script>

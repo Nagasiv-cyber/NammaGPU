@@ -92,6 +92,17 @@ class Chain:
     def register_host(self, stake):
         return self._send("host", self.contract.functions.registerHost(), self.to_wei(stake))[0]
 
+    def withdraw_stake(self):
+        """Host takes its whole deposit back (only allowed when it has no active jobs)."""
+        wei = self.contract.functions.hostStake(self.address("host")).call()
+        if wei == 0:
+            return None
+        return self._send("host", self.contract.functions.withdrawStake(wei))[0]
+
+    def set_rate(self, rate_per_sec):
+        """Pricing agent: change the price for FUTURE bookings."""
+        return self._send("operator", self.contract.functions.setRate(self.to_wei(rate_per_sec)))[0]
+
     # ------------------------------------------------------------ jobs
     def lock_payment(self, job_id, host_address, amount):
         return self._send(

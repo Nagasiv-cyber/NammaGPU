@@ -16,6 +16,9 @@ pragma solidity ^0.8.20;
       * Anyone   can trigger a refund to the buyer if a job is never settled
                  within 1 hour, so buyer money can never be stuck forever.
 
+    Prices: the operator's pricing agent may change ratePerSecond with demand,
+    but every job keeps the rate that applied when its payment was locked.
+
     Deliberately simple: no external libraries, compile with EVM version "paris".
 */
 contract GPUSetuEscrow {
@@ -28,6 +31,7 @@ contract GPUSetuEscrow {
         address buyer;
         address host;
         uint256 amount;       // payment locked by the buyer
+        uint256 rate;         // price per verified second, fixed at booking time
         uint64 createdAt;
         bool closed;
     }
@@ -38,7 +42,7 @@ contract GPUSetuEscrow {
 
     event HostRegistered(address indexed host, uint256 totalStake);
     event StakeWithdrawn(address indexed host, uint256 amount);
-    event PaymentLocked(bytes32 indexed jobId, address indexed buyer, address indexed host, uint256 amount);
+    event PaymentLocked(bytes32 indexed jobId, address indexed buyer, address indexed host, uint256 amount, uint256 rate);
     event Settled(bytes32 indexed jobId, uint256 verifiedSeconds, uint256 paidToHost, uint256 refundedToBuyer);
     event Slashed(bytes32 indexed jobId, address indexed host, uint256 penalty, string reason);
     event Refunded(bytes32 indexed jobId, uint256 amount);
@@ -77,9 +81,9 @@ contract GPUSetuEscrow {
         require(jobs[jobId].buyer == address(0), "job id already used");
         require(hostStake[host] >= minStake, "host not staked");
         require(msg.value > 0, "no payment sent");
-        jobs[jobId] = Job(msg.sender, host, msg.value, uint64(block.timestamp), false);
+        jobs[jobId] = Job(msg.sender, host, msg.value, ratePerSecond, uint64(block.timestamp), false);
         activeJobs[host] += 1;
-        emit PaymentLocked(jobId, msg.sender, host, msg.value);
+        emit PaymentLocked(jobId, msg.sender, host, msg.value, ratePerSecond);
     }
 
     function refundExpired(bytes32 jobId) external {
@@ -94,7 +98,7 @@ contract GPUSetuEscrow {
 
     function settle(bytes32 jobId, uint256 verifiedSeconds) external onlyOperator {
         Job storage j = _openJob(jobId);
-        uint256 pay = verifiedSeconds * ratePerSecond;
+        uint256 pay = verifiedSeconds * j.rate;     // the price agreed when the job was booked
         if (pay > j.amount) pay = j.amount;          // never pay more than was locked
         uint256 refund = j.amount - pay;
         _close(j);

@@ -5,6 +5,9 @@ GPUSetu chain setup — run these ONCE, in order, on the Aspire Lite:
     python setup_chain.py deploy          # put the contract on MST testnet
     python setup_chain.py register-host   # host locks its security deposit
     python setup_chain.py status          # show balances, stake and rate any time
+
+Also useful:
+    python setup_chain.py withdraw-stake  # host takes its deposit back (e.g. before redeploying)
 """
 
 import sys
@@ -43,6 +46,12 @@ def main():
         need_contract(chain)
         tx = chain.register_host(cfg["min_stake"])
         print(f"Host staked {cfg['min_stake']} {sym}. Transaction: {chain.tx_url(tx)}")
+
+    elif command == "withdraw-stake":
+        need_contract(chain)
+        tx = chain.withdraw_stake()
+        print("Host had no deposit in this contract." if tx is None
+              else f"Host deposit returned. Transaction: {chain.tx_url(tx)}")
 
     elif command == "status":
         need_contract(chain)
