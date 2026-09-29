@@ -46,22 +46,54 @@ GPU = pynvml.nvmlDeviceGetHandleByIndex(0)
 _name = pynvml.nvmlDeviceGetName(GPU)
 GPU_NAME = _name.decode() if isinstance(_name, bytes) else _name
 
+nvml_lock = threading.Lock()   # one question to the graphics card at a time
+nvml_failures = 0              # failed readings in a row
+
+
+def _reconnect_gpu():
+    """Laptop GPUs power down when idle; reconnecting to NVML often brings readings back."""
+    global GPU
+    try:
+        pynvml.nvmlShutdown()
+    except Exception:
+        pass
+    pynvml.nvmlInit()
+    GPU = pynvml.nvmlDeviceGetHandleByIndex(0)
+
 
 def read_gpu():
-    """Take one 'photo' of the GPU right now."""
-    util = pynvml.nvmlDeviceGetUtilizationRates(GPU)
-    mem = pynvml.nvmlDeviceGetMemoryInfo(GPU)
-    try:
-        temp = pynvml.nvmlDeviceGetTemperature(GPU, pynvml.NVML_TEMPERATURE_GPU)
-    except pynvml.NVMLError:
-        temp = None
-    return {
+    """Take one 'photo' of the GPU right now. Never crashes:
+    if the GPU is asleep (laptop power saving), it reports gpu_state = 'sleeping'."""
+    global nvml_failures
+    reading = {
         "time": round(time.time(), 2),
-        "gpu_util": util.gpu,                       # % of the GPU cores busy
-        "mem_used_mb": mem.used // (1024 * 1024),   # VRAM in use
-        "mem_total_mb": mem.total // (1024 * 1024), # total VRAM (~6144)
-        "temp_c": temp,
+        "gpu_util": 0,
+        "mem_used_mb": 0,
+        "mem_total_mb": 0,
+        "temp_c": None,
+        "gpu_state": "awake",
     }
+    with nvml_lock:
+        try:
+            util = pynvml.nvmlDeviceGetUtilizationRates(GPU)
+            mem = pynvml.nvmlDeviceGetMemoryInfo(GPU)
+            reading["gpu_util"] = util.gpu                          # % of GPU cores busy
+            reading["mem_used_mb"] = mem.used // (1024 * 1024)      # VRAM in use
+            reading["mem_total_mb"] = mem.total // (1024 * 1024)    # total VRAM (~6144)
+            try:
+                reading["temp_c"] = pynvml.nvmlDeviceGetTemperature(GPU, pynvml.NVML_TEMPERATURE_GPU)
+            except pynvml.NVMLError:
+                pass
+            nvml_failures = 0
+        except pynvml.NVMLError:
+            reading["gpu_state"] = "sleeping"                      # counted as 0% = not billed
+            nvml_failures += 1
+            if nvml_failures % 5 == 0:                              # every 5 misses, try reconnecting
+                try:
+                    _reconnect_gpu()
+                except Exception:
+                    pass
+    return reading
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +164,7 @@ def run_and_watch(job_id, script_path):
             job["runtime_s"] = round(ended - job["started_at"], 1)
             job["busy_seconds"] = sum(1 for s in samples if s["gpu_util"] >= BUSY_THRESHOLD)
             job["peak_util"] = max((s["gpu_util"] for s in samples), default=0)
-            job["peak_mem_mb"] = max((s["mem_used_mb"] for s in samples), default=0)
+            job["peak_mem_mb"] = max((s["mem_used_mb"] or 0 for s in samples), default=0)
 
 
 def log_tail(job_id, lines=8):

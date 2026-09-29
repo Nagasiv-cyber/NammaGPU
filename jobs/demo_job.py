@@ -20,15 +20,19 @@ def load_data(device):
     """Real MNIST if available (pre-download it!), otherwise random fake images."""
     try:
         from torchvision import datasets
-        ds = datasets.MNIST(DATA_DIR, train=True, download=False)  # never download during a demo
-        x = ds.data.float().div(255).unsqueeze(1)   # shape: 60000 x 1 x 28 x 28
+        ds = datasets.MNIST(DATA_DIR, train=True, download=False)   # never download during a demo
+        test = datasets.MNIST(DATA_DIR, train=False, download=False)
+        x = ds.data.float().div(255).unsqueeze(1)   # 60000 training images: 1 x 28 x 28 each
         y = ds.targets
-        print("Data: real MNIST", flush=True)
+        xt = test.data.float().div(255).unsqueeze(1)   # 10000 images the model NEVER trains on
+        yt = test.targets
+        print("Data: real MNIST (60,000 training images, 10,000 unseen test images)", flush=True)
     except Exception as e:
         print(f"Data: MNIST unavailable ({e}) -> using synthetic data", flush=True)
         x = torch.rand(60000, 1, 28, 28)
         y = torch.randint(0, 10, (60000,))
-    return x.to(device), y.to(device)
+        xt, yt = x[:10000], y[:10000]
+    return x.to(device), y.to(device), xt.to(device), yt.to(device)
 
 
 class SmallCNN(nn.Module):
@@ -55,7 +59,7 @@ def main():
     device = torch.device("cuda")
     print(f"GPU: {torch.cuda.get_device_name(0)}", flush=True)
 
-    x, y = load_data(device)
+    x, y, xt, yt = load_data(device)
     model = SmallCNN().to(device)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
 
@@ -77,10 +81,10 @@ def main():
     correct = 0
     with torch.no_grad():
         for i in range(0, 10000, 1000):          # check 1000 images at a time
-            preds = model(x[i:i + 1000]).argmax(1)
-            correct += (preds == y[i:i + 1000]).sum().item()
+            preds = model(xt[i:i + 1000]).argmax(1)       # score on UNSEEN test images
+            correct += (preds == yt[i:i + 1000]).sum().item()
     acc = correct / 10000
-    print(f"DONE: {steps} steps in {time.time() - start:.1f}s, accuracy={acc:.2%}", flush=True)
+    print(f"DONE: {steps} steps in {time.time() - start:.1f}s, test accuracy={acc:.2%}", flush=True)
 
 
 if __name__ == "__main__":
