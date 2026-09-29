@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>GPUSetu</title>
+<title>NammaGPU console</title>
 <style>
   :root {
     --bg: #EEF1F4;
@@ -134,6 +134,17 @@
   .tag.fraud { background: #FBEDEC; color: var(--danger); }
   .tag.cloud { background: #EEF2F7; color: var(--gpu); }
 
+  .files { margin-top: 14px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 6px; font-size: 14px; }
+  .files h3 { font-size: 14px; margin: 0 0 8px; }
+  .files .file { display: grid; grid-template-columns: 1fr auto auto; gap: 12px; align-items: center; padding: 6px 0; border-top: 1px solid var(--line); }
+  .files .file:first-of-type { border-top: none; }
+  .files .fname { font-weight: 600; }
+  .files .fp { font-family: ui-monospace, Consolas, monospace; font-size: 12px; color: var(--muted); }
+  .files a.dl { background: var(--gpu); color: #fff; text-decoration: none; font-weight: 600; font-size: 13px; padding: 6px 12px; border-radius: 6px; }
+  .files a.dl:hover { background: #2F4866; }
+  .files .ok { color: var(--ok); font-weight: 600; font-size: 12px; }
+  .files .note { font-size: 13px; color: var(--muted); margin-top: 8px; }
+
   table { width: 100%; border-collapse: collapse; font-size: 14px; }
   th { text-align: left; font-weight: 600; color: var(--muted); padding: 8px 6px; border-bottom: 1px solid var(--line); }
   td { padding: 8px 6px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
@@ -145,7 +156,7 @@
 <div class="wrap">
 
   <header>
-    <div class="brand">GPUSetu<small>Pay only for GPU seconds that did real work</small></div>
+    <div class="brand">NammaGPU<small>Pay only for GPU seconds that did real work</small></div>
     <div class="host" id="hostPill">
       <span class="dot" id="hostDot"></span>
       <span class="name" id="hostName">Looking for hosts</span>
@@ -210,6 +221,7 @@
         <div class="s">Startup and idle seconds are never billed.</div>
       </div>
     </div>
+    <div class="files" id="rFiles" hidden></div>
     <div class="chain" id="rChain" hidden></div>
     <div class="result" id="rResult"></div>
     <pre id="rLog"></pre>
@@ -411,11 +423,37 @@ function renderChain(c) {
   box.hidden = false;
 }
 
+function renderFiles(d) {
+  const box = $("rFiles");
+  if (!d || d.status === "none") { box.hidden = true; return; }
+  const size = n => n >= 1e6 ? (n / 1e6).toFixed(1) + " MB" : n >= 1e3 ? (n / 1e3).toFixed(1) + " KB" : n + " bytes";
+  let body;
+  if (d.status === "copying") {
+    body = `<div class="pending">Copying files from the host and checking their fingerprints…</div>`;
+  } else if (d.status === "withheld") {
+    body = `<div class="bad">Output withheld: the host was caught cheating, so nothing it produced is trusted.</div>`;
+  } else {
+    const order = n => n === "model.pt" ? 0 : n === "load_model.py" ? 1 : 2;
+    body = [...d.files].sort((a, b) => order(a.name) - order(b.name)).map(f => f.error
+      ? `<div class="file"><span class="fname">${f.name}</span><span class="bad">Delivery failed: ${f.error}</span><span></span></div>`
+      : `<div class="file">
+           <span><span class="fname">${f.name}</span> <span class="fp">${size(f.size_bytes)}, SHA-256 ${f.sha256.slice(0, 12)}…</span></span>
+           <span class="${f.verified ? "ok" : "bad"}">${f.verified ? "Fingerprint matches host" : "Fingerprint MISMATCH"}</span>
+           ${f.verified ? `<a class="dl" href="${f.url}" download>Download</a>` : "<span></span>"}
+         </div>`).join("") +
+      `<div class="note">Saved on this laptop in ${d.folder || "results/"}. Load it with <b>python load_model.py</b>.</div>`;
+  }
+  box.innerHTML = `<h3>Your trained model</h3>${body}`;
+  box.hidden = false;
+}
+
 async function pollChain(jobId) {
   try {
     const j = await api("/api/jobs/" + jobId);
     renderChain(j.chain);
-    if (j.chain && ["locked", "settling", "slashing"].includes(j.chain.status)) {
+    renderFiles(j.delivery);
+    const deliveryPending = !j.delivery || j.delivery.status === "copying";
+    if ((j.chain && ["locked", "settling", "slashing"].includes(j.chain.status)) || (j.source === "peer" && deliveryPending)) {
       setTimeout(() => pollChain(jobId), 2000);
     } else {
       loadChain(); loadHistory();
@@ -483,7 +521,7 @@ async function pollJob() {
       const finishedId = currentJob;
       currentJob = null;
       setButtons();
-      if (j.chain && j.chain.status !== "off") pollChain(finishedId);
+      if (j.source === "peer" || (j.chain && j.chain.status !== "off")) pollChain(finishedId);
       const fraud = j.audit && j.audit.verdict === "fraud";
       setMsg(fraud ? "Fraud detected. The host is being slashed. Receipt below."
         : (j.status === "finished" ? "Job finished. Receipt below." : "Job ended with status: " + j.status),
@@ -530,6 +568,7 @@ function showReceipt(j) {
     : "Model result: " + done.replace("DONE: ", "");
   $("rLog").textContent = (j.log_tail || []).join("\n");
   renderChain(j.chain);
+  renderFiles(j.delivery);
   $("receipt").hidden = false;
 }
 

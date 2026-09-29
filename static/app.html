@@ -1,0 +1,723 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NammaGPU: rent a GPU by the second</title>
+<style>
+  :root {
+    --concrete: #EEF0EC;
+    --paper: #FFFFFF;
+    --asphalt: #2B2D2F;
+    --ink: #23262A;
+    --muted: #5E646B;
+    --line: #D6DAD4;
+    --yellow: #F2C230;
+    --yellow-deep: #C99A0B;
+    --green: #1E7B45;
+    --red: #C62828;
+    --meter: #1F2224;
+    --meter-soft: #9AA3AB;
+    --display: "Bahnschrift", "DIN Alternate", "Arial Narrow", sans-serif;
+    --body: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } * { transition: none !important; } }
+  body { margin: 0; background: var(--concrete); color: var(--ink); font: 16px/1.55 var(--body); }
+  a { color: inherit; }
+  :focus-visible { outline: 3px solid var(--yellow-deep); outline-offset: 2px; }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 0 24px; }
+
+  /* ---------- top bar ---------- */
+  .bar { background: var(--asphalt); color: #F4F5F3; }
+  .bar .wrap { display: flex; align-items: center; gap: 28px; min-height: 64px; flex-wrap: wrap; padding-top: 8px; padding-bottom: 8px; }
+  .logo { font-family: var(--display); font-weight: 700; font-size: 26px; letter-spacing: 0.3px; text-decoration: none; display: flex; align-items: center; gap: 10px; }
+  .logo .plate { background: var(--yellow); color: var(--asphalt); border-radius: 4px; padding: 0 7px; font-size: 18px; line-height: 26px; }
+  nav { display: flex; gap: 4px; flex-wrap: wrap; }
+  nav a { text-decoration: none; padding: 8px 12px; border-radius: 6px; color: #C9CDD1; font-weight: 600; font-size: 15px; }
+  nav a:hover { color: #fff; }
+  nav a[aria-current="page"] { color: var(--asphalt); background: var(--yellow); }
+  .pill { margin-left: auto; display: flex; align-items: center; gap: 8px; font-size: 14px; color: #C9CDD1; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--meter-soft); flex: none; }
+  .dot.idle { background: #3DBE72; } .dot.busy { background: var(--yellow); } .dot.offline { background: #E5544B; }
+
+  section.view { display: none; padding: 40px 0 64px; }
+  section.view.on { display: block; }
+  h1, h2, h3 { font-family: var(--display); font-stretch: semi-condensed; line-height: 1.1; margin: 0; }
+  h2 { font-size: 30px; margin-bottom: 6px; }
+  h3 { font-size: 20px; margin-bottom: 4px; }
+  .lede { color: var(--muted); max-width: 62ch; margin: 0 0 24px; }
+
+  /* ---------- buttons ---------- */
+  .btn { font: 600 16px var(--body); border-radius: 8px; padding: 12px 20px; border: 2px solid transparent; cursor: pointer; text-decoration: none; display: inline-block; }
+  .btn.go { background: var(--yellow); color: var(--asphalt); }
+  .btn.go:hover { background: #E4B31E; }
+  .btn.plain { background: transparent; color: var(--ink); border-color: var(--asphalt); }
+  .btn.plain:hover { background: #fff; }
+  .btn.warn { background: var(--paper); color: var(--red); border-color: var(--red); }
+  .btn:disabled, .btn:disabled:hover { background: #D9DCD8; color: #7C8288; border-color: #D9DCD8; cursor: not-allowed; }
+
+  /* ---------- the meter (signature element) ---------- */
+  .meter { background: var(--meter); color: #F4F5F3; border-radius: 14px; padding: 22px 24px; border: 4px solid #3A3E42; box-shadow: inset 0 0 0 1px #000; }
+  .meter .top { display: flex; justify-content: space-between; gap: 12px; font-size: 14px; color: var(--meter-soft); }
+  .readout { font-family: var(--display); font-variant-numeric: tabular-nums; color: var(--yellow); line-height: 1; }
+  .readout.big { font-size: clamp(56px, 9vw, 96px); font-weight: 700; margin: 12px 0 2px; letter-spacing: 1px; }
+  .readout .u { font-size: 0.3em; color: var(--meter-soft); margin-left: 8px; font-weight: 400; letter-spacing: 0; }
+  .meter .fare { font-family: var(--display); font-variant-numeric: tabular-nums; font-size: 34px; color: #F4F5F3; margin: 10px 0 14px; }
+  .meter .fare small { font-size: 16px; color: var(--meter-soft); }
+  .meter dl { display: grid; grid-template-columns: 1fr auto; gap: 6px 16px; margin: 0; font-size: 14px; border-top: 1px solid #3A3E42; padding-top: 12px; }
+  .meter dt { color: var(--meter-soft); }
+  .meter dd { margin: 0; text-align: right; font-family: var(--display); font-variant-numeric: tabular-nums; }
+
+  /* ---------- home ---------- */
+  .hero { display: grid; grid-template-columns: 1.15fr 1fr; gap: 48px; align-items: center; }
+  .hero h1 { font-size: clamp(40px, 6vw, 68px); max-width: 13ch; }
+  .hero p { font-size: 18px; color: var(--muted); max-width: 52ch; margin: 18px 0 26px; }
+  .hero .ctas { display: flex; gap: 12px; flex-wrap: wrap; }
+  .origin { margin-top: 22px; font-size: 14px; color: var(--muted); }
+  .route { margin-top: 56px; }
+  .route ol { list-style: none; padding: 0; margin: 20px 0 0; display: grid; grid-template-columns: repeat(5, 1fr); position: relative; }
+  .route ol::before { content: ""; position: absolute; top: 15px; left: 10%; right: 10%; height: 4px; background: repeating-linear-gradient(90deg, var(--asphalt) 0 18px, transparent 18px 30px); }
+  .route li { position: relative; text-align: center; padding: 0 10px; }
+  .route .stop { width: 34px; height: 34px; border-radius: 50%; background: var(--yellow); color: var(--asphalt); font: 700 16px var(--display); display: grid; place-items: center; margin: 0 auto 10px; position: relative; border: 3px solid var(--concrete); }
+  .route b { display: block; font-family: var(--display); font-size: 17px; }
+  .route span { font-size: 14px; color: var(--muted); }
+  .sides { display: grid; grid-template-columns: 1fr 1fr; gap: 0; margin-top: 56px; border-top: 2px solid var(--asphalt); }
+  .sides > div { padding: 22px 28px 0 0; }
+  .sides > div + div { padding-left: 28px; border-left: 1px solid var(--line); }
+  .sides p { color: var(--muted); margin: 6px 0 14px; }
+
+  /* ---------- rent ---------- */
+  .rent { display: grid; grid-template-columns: 1fr 420px; gap: 28px; align-items: start; }
+  .panel { background: var(--paper); border-radius: 10px; padding: 22px; border: 1px solid var(--line); }
+  .panel + .panel { margin-top: 18px; }
+  .choice { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; padding: 14px; border: 2px solid var(--line); border-radius: 8px; cursor: pointer; margin-top: 10px; }
+  .choice input { margin-top: 4px; accent-color: var(--asphalt); width: 18px; height: 18px; }
+  .choice b { font-size: 16px; }
+  .choice small { grid-column: 2; color: var(--muted); font-size: 14px; }
+  .choice.on { border-color: var(--asphalt); }
+  .choice.off { opacity: 0.55; cursor: not-allowed; }
+  .quote { display: grid; grid-template-columns: 1fr auto; gap: 8px 16px; margin: 6px 0 18px; }
+  .quote dt { color: var(--muted); }
+  .quote dd { margin: 0; text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .quote dd.why { grid-column: 1 / -1; font-size: 13px; color: var(--muted); margin-top: -4px; text-align: left; font-weight: 400; }
+  .fineprint { font-size: 13px; color: var(--muted); margin: 10px 0 0; }
+  #msg { margin: 12px 0 0; font-weight: 600; }
+  #msg.error { color: var(--red); }
+
+  .journey { list-style: none; margin: 8px 0 0; padding: 0; }
+  .journey li { display: grid; grid-template-columns: 30px 1fr; gap: 12px; padding: 10px 0; position: relative; }
+  .journey li:not(:last-child)::after { content: ""; position: absolute; left: 14px; top: 38px; bottom: -4px; width: 2px; background: var(--line); }
+  .journey .n { width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; font: 700 14px var(--display); background: var(--concrete); color: var(--muted); border: 2px solid var(--line); }
+  .journey .t b { display: block; }
+  .journey .t span { font-size: 14px; color: var(--muted); }
+  .journey li.active .n { background: var(--yellow); color: var(--asphalt); border-color: var(--yellow-deep); }
+  .journey li.done .n { background: var(--green); color: #fff; border-color: var(--green); }
+  .journey li.failed .n { background: var(--red); color: #fff; border-color: var(--red); }
+  .journey li.skipped { opacity: 0.55; }
+
+  canvas { display: block; width: 100%; }
+  #tape { height: 26px; margin-top: 14px; }
+  #graph { height: 120px; margin-top: 12px; }
+  .legend { display: flex; gap: 16px; font-size: 13px; color: var(--meter-soft); margin-top: 8px; flex-wrap: wrap; }
+  .legend i { display: inline-block; width: 11px; height: 11px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
+
+  /* ---------- receipt ---------- */
+  .receipt { margin-top: 28px; }
+  .receipt[hidden] { display: none; }
+  .verdict { border-radius: 8px; padding: 12px 14px; margin: 12px 0; }
+  .verdict b { display: block; font-family: var(--display); font-size: 18px; }
+  .verdict.honest { background: #E7F3EC; } .verdict.honest b { color: var(--green); }
+  .verdict.fraud { background: #FBE9E8; } .verdict.fraud b { color: var(--red); }
+  .verdict.cloud { background: var(--concrete); }
+  .nums { display: grid; grid-template-columns: repeat(3, 1fr); border-top: 2px solid var(--asphalt); border-bottom: 1px solid var(--line); margin: 14px 0; }
+  .nums > div { padding: 12px 14px 12px 0; }
+  .nums > div + div { padding-left: 14px; border-left: 1px solid var(--line); }
+  .nums .k { font-size: 13px; color: var(--muted); }
+  .nums .v { font-family: var(--display); font-size: 30px; font-variant-numeric: tabular-nums; }
+  .nums .s { font-size: 13px; color: var(--muted); }
+  .rows { margin-top: 16px; }
+  .rows h3 { font-size: 18px; margin-bottom: 6px; }
+  .row { display: flex; justify-content: space-between; gap: 16px; padding: 7px 0; border-top: 1px solid var(--line); flex-wrap: wrap; font-size: 15px; }
+  .row > span:first-child { color: var(--muted); }
+  .row a { font-weight: 600; }
+  .hash { font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
+  .good { color: var(--green); font-weight: 600; } .bad { color: var(--red); font-weight: 600; } .wait { color: var(--yellow-deep); font-weight: 600; }
+  .dl { background: var(--asphalt); color: #fff; text-decoration: none; padding: 5px 12px; border-radius: 6px; font-size: 14px; font-weight: 600; }
+  pre { background: var(--concrete); border-radius: 6px; padding: 12px; font-size: 13px; overflow-x: auto; margin: 12px 0 0; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 15px; }
+  th { text-align: left; color: var(--muted); font-weight: 600; padding: 8px 6px; border-bottom: 2px solid var(--asphalt); }
+  td { padding: 9px 6px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+  .num { text-align: right; }
+  .tag { font-size: 13px; font-weight: 600; padding: 2px 9px; border-radius: 999px; background: var(--concrete); }
+  .tag.fraud { background: #FBE9E8; color: var(--red); } .tag.cloud { background: #E4E8EE; }
+  .empty { color: var(--muted); padding: 12px 0 0; }
+
+  /* ---------- host ---------- */
+  .gpu-head { display: flex; justify-content: space-between; align-items: flex-end; gap: 20px; flex-wrap: wrap; border-bottom: 2px solid var(--asphalt); padding-bottom: 16px; }
+  .gpu-head .name { font-family: var(--display); font-size: clamp(28px, 4vw, 40px); font-stretch: semi-condensed; }
+  .badges { display: flex; gap: 8px; flex-wrap: wrap; }
+  .badge { font-size: 14px; font-weight: 600; padding: 4px 12px; border-radius: 999px; background: var(--paper); border: 1px solid var(--line); }
+  .earn { display: grid; grid-template-columns: repeat(3, 1fr); margin: 22px 0 28px; }
+  .earn > div { padding-right: 18px; }
+  .earn > div + div { padding-left: 18px; border-left: 1px solid var(--line); }
+  .earn .v { font-family: var(--display); font-size: 36px; font-variant-numeric: tabular-nums; }
+  .earn .k { color: var(--muted); font-size: 14px; }
+  .host-grid { display: grid; grid-template-columns: 1fr 360px; gap: 28px; align-items: start; }
+  .demo { border: 2px dashed var(--red); border-radius: 10px; padding: 18px; background: var(--paper); }
+  .demo p { color: var(--muted); font-size: 14px; }
+  code.cmd { display: block; background: var(--asphalt); color: #F4F5F3; padding: 10px 12px; border-radius: 6px; font-size: 13px; margin-top: 8px; overflow-x: auto; }
+
+  /* ---------- verify ---------- */
+  .checks { display: grid; grid-template-columns: 1fr 1fr; gap: 28px 48px; margin-top: 12px; }
+  .checks div { border-top: 2px solid var(--asphalt); padding-top: 12px; }
+  .checks p { color: var(--muted); margin: 6px 0 0; max-width: 60ch; }
+  .facts { margin-top: 36px; }
+
+  footer { border-top: 1px solid var(--line); padding: 20px 0 32px; color: var(--muted); font-size: 14px; }
+
+  @media (min-width: 981px) { .rent > .meter { position: sticky; top: 16px; } }
+  @media (max-width: 980px) {
+    .hero, .rent, .host-grid { grid-template-columns: 1fr; }
+    .route ol { grid-template-columns: 1fr; gap: 16px; }
+    .route ol::before { display: none; }
+    .route li { text-align: left; display: grid; grid-template-columns: 40px 1fr; gap: 0 10px; }
+    .route .stop { margin: 0; grid-row: span 2; }
+    .sides, .checks { grid-template-columns: 1fr; }
+    .sides > div + div { padding-left: 0; border-left: none; border-top: 1px solid var(--line); padding-top: 22px; }
+    .pill { margin-left: 0; }
+  }
+  @media (max-width: 620px) {
+    .nums, .earn { grid-template-columns: 1fr; }
+    .nums > div + div, .earn > div + div { border-left: none; padding-left: 0; border-top: 1px solid var(--line); }
+  }
+</style>
+</head>
+<body>
+
+<header class="bar">
+  <div class="wrap">
+    <a class="logo" href="#home" aria-label="NammaGPU home">NammaGPU <span class="plate">GPU meter</span></a>
+    <nav aria-label="Main">
+      <a href="#rent" data-view="rent">Rent a GPU</a>
+      <a href="#host" data-view="host">Share your GPU</a>
+      <a href="#verify" data-view="verify">How we verify</a>
+    </nav>
+    <div class="pill" aria-live="polite"><span class="dot" id="hostDot"></span><span id="hostText">Looking for GPUs</span></div>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <!-- ================= HOME ================= -->
+  <section class="view" id="home">
+    <div class="hero">
+      <div>
+        <h1>Pay for the seconds your job used. Not one more.</h1>
+        <p>NammaGPU rents idle GPUs from college labs and gaming cafés to students, by the second. The meter reads the graphics card itself, so you pay only while it is actually working.</p>
+        <div class="ctas">
+          <a class="btn go" href="#rent">Rent a GPU</a>
+          <a class="btn plain" href="#host">Share your GPU</a>
+        </div>
+        <p class="origin">Built in Namma Bengaluru by students from Chennai. "Namma" means "our" in Kannada and Tamil.</p>
+      </div>
+      <div class="meter" aria-label="Live GPU meter">
+        <div class="top"><span id="hmGpu">Nearest GPU</span><span id="hmState">checking</span></div>
+        <div class="readout big"><span id="hmUtil">0</span><span class="u">% busy now</span></div>
+        <div class="fare"><span id="hmRate">0.00100</span> <small>tMSTC per working second</small></div>
+        <dl>
+          <dt>GPU memory</dt><dd id="hmMem">–</dd>
+          <dt>Temperature</dt><dd id="hmTemp">–</dd>
+          <dt>Pricing</dt><dd id="hmWhy">–</dd>
+        </dl>
+      </div>
+    </div>
+
+    <div class="route">
+      <h2>What happens when you rent</h2>
+      <ol>
+        <li><div class="stop">1</div><b>Price locked</b><span>The per-second price is fixed when you book.</span></li>
+        <li><div class="stop">2</div><b>Payment held safely</b><span>Your payment waits in escrow on MST Blockchain.</span></li>
+        <li><div class="stop">3</div><b>Runs sealed</b><span>Your job runs in a sandbox with no internet access.</span></li>
+        <li><div class="stop">4</div><b>GPU checks the work</b><span>Only seconds the card was busy are counted.</span></li>
+        <li><div class="stop">5</div><b>Everyone is paid fairly</b><span>The host gets paid, you get the rest back and your files.</span></li>
+      </ol>
+    </div>
+
+    <div class="sides">
+      <div>
+        <h3>For students</h3>
+        <p>No dollar card, no researcher credentials, no paying for a GPU that sat idle. Train your model and download it with proof it's genuine.</p>
+        <a class="btn go" href="#rent">Rent a GPU</a>
+      </div>
+      <div>
+        <h3>For labs, cafés and gamers</h3>
+        <p>Earn from the hours your GPU sits idle. Payment is guaranteed by a contract, and strangers' code can't touch your files.</p>
+        <a class="btn plain" href="#host">Share your GPU</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= RENT ================= -->
+  <section class="view" id="rent">
+    <h2>Rent a GPU</h2>
+    <p class="lede">Pick what to run. You pay only for seconds where the GPU is measurably working; startup time is free.</p>
+
+    <div class="rent">
+      <div>
+        <div class="panel">
+          <h3>What do you want to run?</h3>
+          <label class="choice on"><input type="radio" name="work" value="mnist" checked><b>Train a digit-recognition model</b><small>About 30 seconds of GPU work. You receive the trained model file, a loader script and a model card.</small></label>
+          <label class="choice off"><input type="radio" name="work" disabled><b>Generate images from a prompt</b><small>Coming next.</small></label>
+          <label class="choice off"><input type="radio" name="work" disabled><b>Bring your own job</b><small>On the roadmap. It will run in the same sealed sandbox.</small></label>
+        </div>
+
+        <div class="panel">
+          <h3>Your quote</h3>
+          <dl class="quote">
+            <dt>Price per working second</dt><dd id="qRate">–</dd>
+            <dd class="why" id="qWhy"></dd>
+            <dt>Estimated fare for about 30 s</dt><dd id="qEst">–</dd>
+            <dt>Held in escrow, unused part refunded</dt><dd id="qLock">–</dd>
+            <dt>GPU</dt><dd id="qGpu">–</dd>
+          </dl>
+          <button class="btn go" id="runBtn">Pay into escrow and start</button>
+          <p class="fineprint">This prototype pays with MST test tokens. In production, students pay by UPI or RuPay and hosts receive rupees.</p>
+          <p id="msg" role="status"></p>
+        </div>
+
+        <div class="panel">
+          <h3>Your job's journey</h3>
+          <ol class="journey" id="journey">
+            <li data-step="price"><span class="n">1</span><div class="t"><b>Price locked</b><span>Waiting for you to start.</span></div></li>
+            <li data-step="escrow"><span class="n">2</span><div class="t"><b>Payment held in escrow</b><span>On MST Blockchain, before any GPU work.</span></div></li>
+            <li data-step="run"><span class="n">3</span><div class="t"><b>Running in the sealed sandbox</b><span>No internet, read-only files.</span></div></li>
+            <li data-step="verify"><span class="n">4</span><div class="t"><b>Work checked against the GPU</b><span>The host's claim is compared with the telemetry.</span></div></li>
+            <li data-step="settle"><span class="n">5</span><div class="t"><b>Paid and delivered</b><span>Host paid, your change refunded, files handed over.</span></div></li>
+          </ol>
+        </div>
+      </div>
+
+      <div class="meter" aria-live="polite">
+        <div class="top"><span>Working seconds</span><span id="mState">Meter off</span></div>
+        <div class="readout big"><span id="mSecs">0</span><span class="u">s</span></div>
+        <div class="fare"><span id="mFare">0.000000</span> <small id="mFareK">tMSTC so far</small></div>
+        <dl>
+          <dt>Time on the GPU</dt><dd id="mWall">0.0 s</dd>
+          <dt>GPU now</dt><dd id="mUtil">–</dd>
+          <dt>Memory</dt><dd id="mMem">–</dd>
+        </dl>
+        <canvas id="graph" aria-label="GPU use over the last minute"></canvas>
+        <canvas id="tape" aria-label="One block per second of this job"></canvas>
+        <div class="legend"><span><i style="background:#F2C230"></i>Paid second</span><span><i style="background:#5A6066"></i>Free second (startup or idle)</span></div>
+      </div>
+    </div>
+
+    <div class="panel receipt" id="receipt" hidden>
+      <h3 id="rTitle">Receipt</h3>
+      <div id="rSub" class="fineprint"></div>
+      <div class="verdict" id="rVerdict" hidden></div>
+      <div class="nums">
+        <div><div class="k" id="rWallK">Time on the GPU</div><div class="v" id="rWall"></div><div class="s" id="rWallS"></div></div>
+        <div><div class="k">Working seconds paid</div><div class="v" id="rPaid"></div><div class="s" id="rPaidS"></div></div>
+        <div><div class="k">Saved versus paying by the clock</div><div class="v" id="rSaved"></div><div class="s">Startup seconds are always free.</div></div>
+      </div>
+      <div class="rows" id="rFiles" hidden></div>
+      <div class="rows" id="rChain" hidden></div>
+      <p id="rResult"></p>
+      <pre id="rLog"></pre>
+    </div>
+
+    <div class="panel" style="margin-top:28px">
+      <h3>Your jobs</h3>
+      <p class="fineprint" id="kpi"></p>
+      <table><thead><tr><th>Job</th><th>Ran on</th><th>Result</th><th class="num">Paid seconds</th><th class="num">Fare (tMSTC)</th></tr></thead><tbody id="history"></tbody></table>
+      <p class="empty" id="historyEmpty">No jobs yet. Start one above.</p>
+    </div>
+  </section>
+
+  <!-- ================= HOST ================= -->
+  <section class="view" id="host">
+    <div class="gpu-head">
+      <div>
+        <div class="fineprint">Your GPU on NammaGPU</div>
+        <div class="name" id="gName">Looking for your GPU</div>
+      </div>
+      <div class="badges"><span class="badge" id="gState">–</span><span class="badge" id="gSandbox">–</span><span class="badge" id="gTemp">–</span></div>
+    </div>
+
+    <div class="earn">
+      <div><div class="v" id="gEarned">–</div><div class="k">Wallet balance (tMSTC)</div></div>
+      <div><div class="v" id="gStake">–</div><div class="k" id="gStakeK">Security deposit (tMSTC)</div></div>
+      <div><div class="v" id="gRep">–</div><div class="k">Honest jobs served, jobs slashed</div></div>
+    </div>
+
+    <div class="host-grid">
+      <div class="panel">
+        <h3>Jobs this GPU served</h3>
+        <table><thead><tr><th>Job</th><th>Result</th><th class="num">Paid seconds</th><th class="num">Earned (tMSTC)</th></tr></thead><tbody id="hostJobs"></tbody></table>
+        <p class="empty" id="hostEmpty">No jobs yet. Rent your own GPU from the Rent tab to try it.</p>
+      </div>
+      <div>
+        <div class="panel">
+          <h3>How you earn</h3>
+          <p class="fineprint" style="margin-top:6px">You keep your GPU online. Students' payments are locked in escrow before any work starts, so you are guaranteed to be paid for every second your card works. Your security deposit stays with you as long as you are honest.</p>
+        </div>
+        <div class="demo" style="margin-top:18px">
+          <h3>Demo controls</h3>
+          <p>Show what happens when a host cheats: this runs a fake job that prints convincing progress but never uses the GPU, then claims full payment.</p>
+          <button class="btn warn" id="cheatBtn">Simulate a cheating host</button>
+          <p>After a slash, the host puts up a new deposit from the marketplace laptop:</p>
+          <code class="cmd">python setup_chain.py register-host</code>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= VERIFY ================= -->
+  <section class="view" id="verify">
+    <h2>How we verify</h2>
+    <p class="lede">Renting a stranger's GPU needs trust on both sides. These are the checks that make it safe, and you can inspect every one of them.</p>
+    <div class="checks">
+      <div><h3>The meter reads the hardware</h3><p>Every second, the host software asks the graphics card how busy it is, using NVIDIA's own reporting library. A second is paid only if the GPU was at least 20% busy.</p></div>
+      <div><h3>Your money waits in escrow</h3><p>Before any work starts, your payment is locked in a smart contract on MST Blockchain. Nobody, including us, can take it early. If a job is never settled, anyone can trigger a full refund after one hour.</p></div>
+      <div><h3>Cheating costs the host its deposit</h3><p>Every host locks a security deposit. If the GPU telemetry backs less than half of the work a host claims, the contract gives you your payment back plus that deposit. Slow starts are never punished, because you don't pay for them anyway.</p></div>
+      <div><h3>Strangers' code stays sealed</h3><p>Jobs run in a Docker sandbox with no internet, read-only files, a powerless user and memory limits. The only thing shared is the GPU you are paying for.</p></div>
+      <div><h3>You can check your files yourself</h3><p>Each file carries a SHA-256 fingerprint taken on the host. It is checked again when it reaches you, and you can re-test the trained model on your own laptop.</p></div>
+      <div><h3>Prices are locked when you book</h3><p>The price rises when demand is high, like a surge, but a job always pays the price shown when it was booked.</p></div>
+    </div>
+    <div class="panel facts">
+      <h3>On the blockchain</h3>
+      <div class="row"><span>Network</span><span>MST testnet, chain ID 91562037</span></div>
+      <div class="row"><span>Escrow contract</span><span id="vContract">Not connected</span></div>
+      <div class="row"><span>Held in escrow per job</span><span id="vLock">–</span></div>
+      <div class="row"><span>Host security deposit</span><span id="vStake">–</span></div>
+    </div>
+  </section>
+
+</main>
+
+<footer><div class="wrap">NammaGPU prototype for the MST Blockchain hackathon. Payments use MST test tokens only.</div></footer>
+
+<script>
+/* =================== plumbing =================== */
+const $ = id => document.getElementById(id);
+const BUSY = 20, WINDOW = 60;
+let SYMBOL = "tMSTC", CHAIN = { enabled: false }, PRICE = null, HOST = null;
+let currentJob = null, submitting = false, jobSamples = [], live = [], liveFailures = 0, isCloudJob = false;
+
+async function api(path, options) {
+  const r = await fetch(path, options);
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.detail || "Request failed (" + r.status + ")");
+  return body;
+}
+const fmt = (n, d = 6) => (n === undefined || n === null) ? "–" : Number(n).toFixed(d);
+
+/* =================== routing =================== */
+function route() {
+  const view = (location.hash || "#home").slice(1);
+  const known = ["home", "rent", "host", "verify"].includes(view) ? view : "home";
+  document.querySelectorAll("section.view").forEach(s => s.classList.toggle("on", s.id === known));
+  document.querySelectorAll("nav a").forEach(a => {
+    if (a.dataset.view === known) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current");
+  });
+  if (known === "rent") { drawGraph(); drawTape(); }
+  window.scrollTo(0, 0);
+}
+window.addEventListener("hashchange", route);
+
+/* =================== live data =================== */
+async function pollHosts() {
+  try {
+    HOST = (await api("/api/hosts"))[0];
+    const suspended = CHAIN.enabled && CHAIN.host_stake !== undefined && CHAIN.host_stake < CHAIN.min_stake;
+    let state = HOST.status, text;
+    if (HOST.status === "offline") text = "unreachable";
+    else if (suspended) { state = "offline"; text = "suspended"; }
+    else text = HOST.status === "busy" ? "busy" : "free";
+    const short = HOST.gpu ? HOST.gpu.replace("NVIDIA GeForce ", "").replace(" Laptop GPU", "") : "GPU";
+    $("hostDot").className = "dot " + state;
+    $("hostText").textContent = short + " " + text;
+    $("hmGpu").textContent = short;
+    $("hmState").textContent = text.charAt(0).toUpperCase() + text.slice(1);
+    $("qGpu").textContent = HOST.status === "offline" ? "Unreachable, cloud fallback will be used"
+      : suspended ? "Suspended, cloud fallback will be used" : (HOST.gpu || HOST.host_id).replace("NVIDIA GeForce ", "") + ", " + (HOST.status === "busy" ? "busy" : "free");
+    $("gName").textContent = HOST.gpu || HOST.host_id;
+    $("gState").textContent = suspended ? "Suspended: deposit slashed" : HOST.status === "offline" ? "Offline" : HOST.status === "busy" ? "Running a job" : "Online, waiting for jobs";
+    $("gSandbox").textContent = HOST.sandbox === "docker" ? "Sealed Docker sandbox" : "Sandbox off";
+  } catch (e) {
+    $("hostDot").className = "dot offline"; $("hostText").textContent = "Marketplace not responding";
+  }
+}
+
+async function pollLive() {
+  try {
+    const r = await api("/api/live");
+    liveFailures = 0;
+    live.push(r); if (live.length > WINDOW) live.shift();
+    const asleep = r.gpu_state === "sleeping";
+    const util = asleep ? "Sleeping" : r.gpu_util + " %";
+    $("hmUtil").textContent = asleep ? 0 : r.gpu_util;
+    $("mUtil").textContent = util;
+    $("hmMem").textContent = $("mMem").textContent = asleep ? "–" : r.mem_used_mb + " / " + r.mem_total_mb + " MB";
+    $("hmTemp").textContent = r.temp_c == null ? "–" : r.temp_c + " °C";
+    $("gTemp").textContent = r.temp_c == null ? "Temperature –" : r.temp_c + " °C";
+    drawGraph();
+  } catch (e) { liveFailures++; }
+}
+
+async function loadPricing() {
+  try {
+    PRICE = await api("/api/pricing");
+    $("hmRate").textContent = fmt(PRICE.rate_per_sec, 5);
+    $("hmWhy").textContent = PRICE.multiplier === 1 ? "Normal" : PRICE.multiplier + "x demand";
+    $("qRate").textContent = PRICE.rate_per_sec + " " + SYMBOL;
+    $("qWhy").textContent = "Pricing agent: " + PRICE.reason;
+    $("qEst").textContent = "about " + fmt(PRICE.rate_per_sec * 30, 3) + " " + SYMBOL;
+  } catch (e) {}
+}
+
+async function loadChain() {
+  try {
+    CHAIN = await api("/api/chain");
+    SYMBOL = CHAIN.symbol || SYMBOL;
+    if (CHAIN.enabled && CHAIN.host_balance !== undefined) {
+      $("qLock").textContent = CHAIN.lock_amount + " " + SYMBOL;
+      $("gEarned").textContent = fmt(CHAIN.host_balance, 4);
+      $("gStake").textContent = fmt(CHAIN.host_stake, 2) + " / " + fmt(CHAIN.min_stake, 2);
+      $("gStakeK").textContent = CHAIN.host_stake < CHAIN.min_stake ? "Deposit slashed: re-stake to take jobs" : "Security deposit (tMSTC), held while you are honest";
+      $("vContract").innerHTML = CHAIN.explorer_tx_url
+        ? `<a href="${CHAIN.explorer_tx_url.replace("/tx/", "/address/")}${CHAIN.contract}" target="_blank" rel="noopener" class="hash">${CHAIN.contract}</a>`
+        : `<span class="hash">${CHAIN.contract}</span>`;
+      $("vLock").textContent = CHAIN.lock_amount + " " + SYMBOL;
+      $("vStake").textContent = CHAIN.min_stake + " " + SYMBOL;
+    } else {
+      $("qLock").textContent = CHAIN.error ? "Blockchain unreachable" : "Blockchain off in this setup";
+    }
+  } catch (e) {}
+}
+
+/* =================== drawing =================== */
+function setupCanvas(c) {
+  const dpr = window.devicePixelRatio || 1, w = c.clientWidth, h = c.clientHeight;
+  c.width = w * dpr; c.height = h * dpr;
+  const ctx = c.getContext("2d"); ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { ctx, w, h };
+}
+function drawGraph() {
+  const c = $("graph"); if (!c.offsetParent) return;
+  const { ctx, w, h } = setupCanvas(c);
+  ctx.clearRect(0, 0, w, h);
+  ctx.strokeStyle = "#3A3E42"; ctx.lineWidth = 1;
+  [0, 0.5, 1].forEach(f => { const y = 4 + (h - 8) * f; ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke(); });
+  if (live.length < 2) return;
+  const step = w / (WINDOW - 1), x0 = w - (live.length - 1) * step;
+  const pts = live.map((r, i) => [x0 + i * step, 4 + (h - 8) * (1 - (r.gpu_util || 0) / 100)]);
+  ctx.beginPath(); ctx.moveTo(pts[0][0], h); pts.forEach(p => ctx.lineTo(p[0], p[1])); ctx.lineTo(pts[pts.length - 1][0], h); ctx.closePath();
+  ctx.fillStyle = "rgba(242, 194, 48, 0.16)"; ctx.fill();
+  ctx.beginPath(); pts.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]));
+  ctx.strokeStyle = "#F2C230"; ctx.lineWidth = 2.5; ctx.stroke();
+}
+function drawTape() {
+  const c = $("tape"); if (!c.offsetParent) return;
+  const { ctx, w, h } = setupCanvas(c);
+  ctx.clearRect(0, 0, w, h);
+  if (!jobSamples.length) {
+    ctx.fillStyle = "#9AA3AB"; ctx.font = "13px Segoe UI, system-ui, sans-serif";
+    ctx.fillText(isCloudJob ? "Cloud job: billed by the provider's meter" : "One block per second of your job", 0, h / 2 + 4);
+    return;
+  }
+  const bw = w / Math.max(jobSamples.length, 45);
+  jobSamples.forEach((s, i) => { ctx.fillStyle = s.gpu_util >= BUSY ? "#F2C230" : "#5A6066"; ctx.fillRect(i * bw + 1, 2, Math.max(bw - 2, 1), h - 4); });
+}
+window.addEventListener("resize", () => { drawGraph(); drawTape(); });
+
+/* =================== journey =================== */
+function setStep(name, state, note) {
+  const li = document.querySelector(`#journey li[data-step="${name}"]`);
+  li.className = state || "";
+  if (note) li.querySelector(".t span").textContent = note;
+}
+function resetJourney() {
+  const notes = { price: "Waiting for you to start.", escrow: "On MST Blockchain, before any GPU work.", run: "No internet, read-only files.",
+    verify: "The host's claim is compared with the telemetry.", settle: "Host paid, your change refunded, files handed over." };
+  Object.entries(notes).forEach(([k, v]) => setStep(k, "", v));
+}
+function updateJourney(j) {
+  setStep("price", "done", "Locked at " + j.rate + " " + SYMBOL + " per working second.");
+  if (j.source === "cloud") {
+    setStep("escrow", "skipped", "Skipped: cloud jobs are paid off-chain in this prototype.");
+    setStep("run", j.status === "running" ? "active" : "done", "On a cloud GPU because " + j.fallback_reason + ".");
+    setStep("verify", "skipped", "Billed by the cloud provider's meter.");
+    setStep("settle", j.status === "running" ? "" : "done", "Charged " + fmt(j.bill.billed_amount) + " " + SYMBOL + ".");
+    return;
+  }
+  const c = j.chain || {};
+  setStep("escrow", c.status === "off" ? "skipped" : "done", c.status === "off" ? "Blockchain off in this setup." : c.locked_amount + " " + SYMBOL + " locked on MST.");
+  const running = j.status === "running";
+  setStep("run", running ? "active" : "done", running ? (j.samples.length ? "GPU working. The meter is running." : "Starting the sandbox. These seconds are free.")
+    : (j.sandbox === "docker" ? "Finished inside the sealed Docker sandbox." : "Finished."));
+  if (running) { setStep("verify", ""); setStep("settle", ""); return; }
+  const fraud = j.audit && j.audit.verdict === "fraud";
+  setStep("verify", fraud ? "failed" : "done", j.audit ? j.audit.reason : "Checking…");
+  const d = j.delivery || {};
+  const settled = c.status === "settled" || c.status === "slashed" || c.status === "off";
+  const delivered = d.status && d.status !== "copying";
+  let note = fraud ? "Host slashed. You get your payment back plus its deposit." : "Host paid, your change refunded.";
+  if (!settled || !delivered) note = (c.status === "slashing" ? "Taking the host's deposit on MST…" : c.status === "settling" ? "Paying on MST…" : "") + (d.status === "copying" ? " Copying your files…" : "");
+  if (c.status === "failed") note = c.error;
+  setStep("settle", c.status === "failed" ? "failed" : (settled && delivered ? (fraud ? "failed" : "done") : "active"), note.trim());
+}
+
+/* =================== jobs =================== */
+const calm = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+function reveal(id) { $(id).scrollIntoView({ behavior: calm ? "auto" : "smooth", block: "start" }); }
+function setMsg(t, err) { $("msg").textContent = t; $("msg").className = err ? "error" : ""; }
+function setButtons() { const busy = !!(submitting || currentJob); $("runBtn").disabled = busy; $("cheatBtn").disabled = busy; }
+
+async function runJob(type) {
+  if (submitting || currentJob) return;
+  submitting = true; setButtons();
+  location.hash = "#rent";
+  $("receipt").hidden = true; jobSamples = []; isCloudJob = false; resetJourney(); drawTape();
+  setStep("price", "done", "Locked at " + (PRICE ? PRICE.rate_per_sec : "–") + " " + SYMBOL + " per working second.");
+  setStep("escrow", "active", CHAIN.enabled ? "Locking your payment on MST. This takes a few seconds…" : "Starting…");
+  setMsg(type === "fake" ? "Demo: this host will fake the work." : "");
+  try {
+    const job = await api("/api/jobs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ job_type: type }) });
+    currentJob = job.job_id; submitting = false; setButtons();
+    $("mState").textContent = "Meter running"; $("mFareK").textContent = "tMSTC so far";
+    reveal("journey");
+    loadChain(); loadPricing(); pollJob();
+  } catch (e) {
+    submitting = false; setButtons(); setStep("escrow", "failed", e.message); setMsg(e.message, true);
+  }
+}
+
+async function pollJob() {
+  if (!currentJob) return;
+  try {
+    const j = await api("/api/jobs/" + currentJob);
+    isCloudJob = j.source === "cloud";
+    jobSamples = j.samples || [];
+    $("mSecs").textContent = j.bill.verified_seconds;
+    $("mFare").textContent = fmt(j.bill.billed_amount);
+    $("mWall").textContent = j.bill.wall_seconds.toFixed(1) + " s";
+    drawTape(); updateJourney(j);
+    if (j.status === "running") { setTimeout(pollJob, 1000); return; }
+    const done = currentJob; currentJob = null; setButtons();
+    $("mState").textContent = "Meter stopped"; $("mFareK").textContent = "tMSTC fare";
+    showReceipt(j); loadHistory(); reveal("receipt");
+    const fraud = j.audit && j.audit.verdict === "fraud";
+    setMsg(fraud ? "The host was caught faking work and has been slashed." : "Job finished. Your receipt is below.", fraud);
+    followUp(done);
+  } catch (e) { setMsg(e.message, true); setTimeout(pollJob, 2000); }
+}
+
+async function followUp(id) {
+  try {
+    const j = await api("/api/jobs/" + id);
+    updateJourney(j); renderChain(j); renderFiles(j.delivery);
+    const c = j.chain || {}, d = j.delivery || {};
+    const pending = ["locked", "settling", "slashing"].includes(c.status) || (j.source === "peer" && (!d.status || d.status === "copying"));
+    if (pending) setTimeout(() => followUp(id), 2000); else { loadChain(); loadHistory(); }
+  } catch (e) { setTimeout(() => followUp(id), 3000); }
+}
+
+function showReceipt(j) {
+  const b = j.bill, fraud = j.audit && j.audit.verdict === "fraud";
+  $("rTitle").textContent = "Receipt for job " + j.job_id;
+  $("rSub").textContent = j.source === "cloud" ? "Served by " + j.host_id + "." :
+    "Ran on " + j.host_id + ". Peak GPU " + j.peak_util + "%, peak memory " + j.peak_mem_mb + " MB." + (j.sandbox === "docker" ? " Sealed Docker sandbox." : "");
+  const v = $("rVerdict");
+  if (j.source === "cloud") { v.className = "verdict cloud"; v.innerHTML = "<b>Served by cloud fallback</b>No peer GPU was available (" + j.fallback_reason + "). Simulated provider, paid off-chain in this prototype."; v.hidden = false; }
+  else if (j.audit) { v.className = "verdict " + j.audit.verdict; v.innerHTML = "<b>" + (fraud ? "Host caught faking work" : "Work confirmed by the GPU") + "</b>" + j.audit.reason; v.hidden = false; }
+  else v.hidden = true;
+  const saved = b.time_based_amount > 0 ? Math.max(0, (b.time_based_amount - b.billed_amount) / b.time_based_amount * 100) : 0;
+  $("rWallK").textContent = j.source === "cloud" ? "Time on the cloud GPU" : "Time on the GPU";
+  $("rWall").textContent = b.wall_seconds.toFixed(1) + " s";
+  $("rWallS").textContent = "By the clock: " + fmt(b.time_based_amount) + " " + SYMBOL;
+  $("rPaid").textContent = b.verified_seconds + " s";
+  $("rPaidS").textContent = "Fare: " + fmt(b.billed_amount) + " " + SYMBOL;
+  $("rSaved").textContent = saved.toFixed(0) + "%";
+  const doneLine = (j.log_tail || []).find(l => l.startsWith("DONE:"));
+  $("rResult").textContent = !doneLine ? "" : fraud ? "The host reported: " + doneLine.replace("DONE: ", "") + ". Not trusted, because the GPU telemetry doesn't back it up."
+    : "Result: " + doneLine.replace("DONE: ", "");
+  $("rLog").textContent = (j.log_tail || []).join("\n");
+  renderChain(j); renderFiles(j.delivery);
+  $("receipt").hidden = false;
+}
+
+function txLink(url, hash) { return hash ? `<a class="hash" href="${url}" target="_blank" rel="noopener">${hash.slice(0, 10)}…${hash.slice(-6)}</a>` : ""; }
+
+function renderChain(j) {
+  const c = j.chain || {}, box = $("rChain");
+  if (!c.status || c.status === "off") { box.hidden = true; return; }
+  let rows = `<div class="row"><span>Payment held in escrow</span><span>${c.locked_amount} ${SYMBOL}, ${txLink(c.lock_url, c.lock_tx)}</span></div>`;
+  if (c.status === "settled") rows += `<div class="row"><span>Settlement</span><span>${txLink(c.settle_url, c.settle_tx)}</span></div>
+      <div class="row"><span>Paid to the host</span><span>${c.paid_to_host} ${SYMBOL}</span></div>
+      <div class="row"><span>Refunded to you</span><span>${c.refunded_to_buyer} ${SYMBOL}</span></div>`;
+  else if (c.status === "slashed") rows += `<div class="row"><span>Slash</span><span>${txLink(c.slash_url, c.slash_tx)}</span></div>
+      <div class="row"><span>Paid to the host</span><span class="bad">0 ${SYMBOL}</span></div>
+      <div class="row"><span>Refunded to you</span><span>${c.refunded_to_buyer} ${SYMBOL}</span></div>
+      <div class="row"><span>Host's deposit, paid to you</span><span class="good">${c.penalty_to_buyer} ${SYMBOL}</span></div>`;
+  else if (c.status === "failed") rows += `<div class="row"><span>Settlement</span><span class="bad">${c.error}</span></div>`;
+  else rows += `<div class="row"><span>Settlement</span><span class="wait">${c.status === "slashing" ? "Taking the host's deposit…" : "Paying on MST…"}</span></div>`;
+  box.innerHTML = "<h3>Paid on MST Blockchain</h3>" + rows; box.hidden = false;
+}
+
+function renderFiles(d) {
+  const box = $("rFiles");
+  if (!d || d.status === "none") { box.hidden = true; return; }
+  const size = n => n >= 1e6 ? (n / 1e6).toFixed(1) + " MB" : n >= 1e3 ? (n / 1e3).toFixed(1) + " KB" : n + " bytes";
+  const order = n => n === "model.pt" ? 0 : n === "load_model.py" ? 1 : 2;
+  let body;
+  if (d.status === "copying") body = `<div class="row"><span class="wait">Copying your files and checking their fingerprints…</span></div>`;
+  else if (d.status === "withheld") body = `<div class="row"><span class="bad">Nothing delivered: this host was caught cheating, so its output isn't trusted.</span></div>`;
+  else body = [...d.files].sort((a, b) => order(a.name) - order(b.name)).map(f => f.error
+      ? `<div class="row"><span>${f.name}</span><span class="bad">Delivery failed: ${f.error}</span></div>`
+      : `<div class="row"><span><b style="color:var(--ink)">${f.name}</b> ${size(f.size_bytes)}, fingerprint <span class="hash">${f.sha256.slice(0, 12)}…</span></span>
+         <span><span class="${f.verified ? "good" : "bad"}">${f.verified ? "Matches the host" : "Does not match"}</span>
+         ${f.verified ? ` <a class="dl" href="${f.url}" download>Download</a>` : ""}</span></div>`).join("")
+    + `<p class="fineprint">Saved on this laptop in ${d.folder}. Check it yourself with <b>python verify_model.py</b>.</p>`;
+  box.innerHTML = "<h3>" + (d.status === "withheld" ? "Your files" : "Your trained model") + "</h3>" + body; box.hidden = false;
+}
+
+async function loadHistory() {
+  try {
+    const list = await api("/api/jobs");
+    const done = list.filter(j => j.status && j.status !== "running");
+    const peer = done.filter(j => j.source === "peer").length;
+    $("kpi").textContent = done.length ? `Served by peer GPUs: ${peer} of ${done.length} jobs (${Math.round(100 * peer / done.length)}%).` : "";
+    $("historyEmpty").hidden = list.length > 0;
+    const result = j => !j.status || j.status === "running" ? "Running"
+      : j.audit && j.audit.verdict === "fraud" ? '<span class="tag fraud">Host slashed</span>'
+      : j.source === "cloud" ? '<span class="tag cloud">Cloud fallback</span>' : "Paid";
+    $("history").innerHTML = list.map(j => `<tr><td>${j.job_id}</td><td>${j.source === "cloud" ? "Cloud (simulated)" : "RTX 3050 peer"}</td><td>${result(j)}</td>
+      <td class="num">${j.bill ? j.bill.verified_seconds : "–"}</td><td class="num">${j.bill ? fmt(j.bill.billed_amount) : "–"}</td></tr>`).join("");
+    const mine = list.filter(j => j.source === "peer");
+    const honest = mine.filter(j => j.audit && j.audit.verdict === "honest").length;
+    const slashed = mine.filter(j => j.audit && j.audit.verdict === "fraud").length;
+    $("gRep").textContent = honest + " / " + slashed;
+    $("hostEmpty").hidden = mine.length > 0;
+    $("hostJobs").innerHTML = mine.map(j => `<tr><td>${j.job_id}</td><td>${result(j)}</td>
+      <td class="num">${j.bill ? j.bill.verified_seconds : "–"}</td><td class="num">${j.bill ? fmt(j.bill.billed_amount) : "–"}</td></tr>`).join("");
+  } catch (e) {}
+}
+
+/* =================== start =================== */
+$("runBtn").addEventListener("click", () => runJob("mnist"));
+$("cheatBtn").addEventListener("click", () => runJob("fake"));
+route();
+loadChain().then(() => { pollHosts(); loadPricing(); });
+loadHistory();
+setInterval(pollLive, 1000);
+setInterval(pollHosts, 3000);
+setInterval(loadPricing, 5000);
+setInterval(loadChain, 8000);
+</script>
+</body>
+</html>

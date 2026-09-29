@@ -11,4 +11,5 @@ auto_pipeline.log
 outputs/
 # NEVER upload this: it holds wallet private keys
 chain_config.json
-
+mnist_data/
+results/

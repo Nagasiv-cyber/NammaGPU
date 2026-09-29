@@ -13,6 +13,7 @@ Every job goes through:
   5. ANOMALY AGENT   host's claim vs. telemetry  ->  SETTLE honestly, or SLASH a cheater
 """
 
+import hashlib
 import json
 import os
 import threading
@@ -66,9 +67,11 @@ CLOUD_RUN = 15            # seconds the simulated job runs
 CLOUD_WHOLESALE_SHARE = 0.75   # we pay the provider 75% of the buyer's price; 25% is our margin
 
 BASE_DIR = Path(__file__).parent
+RESULTS_DIR = BASE_DIR / "results"      # buyer's copies of delivered files: results/<job_id>/
 jobs = {}                               # the marketplace's job book
 request_log = deque(maxlen=500)         # times of recent job requests (for the pricing agent)
 settle_guard = threading.Lock()         # a job is settled or slashed exactly once
+delivery_guard = threading.Lock()       # a job's files are delivered exactly once
 match_guard = threading.Lock()          # two requests can't grab the same host at once
 reserved = set()                        # hosts promised to a job still being set up
 
@@ -120,7 +123,8 @@ def host_status(host):
         try:
             info = host_call(host, "/")
             return {"host_id": host["host_id"], "url": host["url"],
-                    "gpu": info.get("gpu"), "status": info.get("status")}
+                    "gpu": info.get("gpu"), "status": info.get("status"),
+                    "sandbox": info.get("sandbox", "none")}
         except Exception as e:
             last_error = e
     print(f"Host {host['host_id']} unreachable: {last_error}")
@@ -240,6 +244,37 @@ def slash_in_background(job_id, reason):
 
 
 # ---------------------------------------------------------------------------
+# 6b. DELIVERY: copy the job's files from the host and verify their fingerprints
+# ---------------------------------------------------------------------------
+def deliver_in_background(job_id, host, host_job_id, artifacts):
+    job = jobs[job_id]
+    job["delivery"] = {"status": "copying", "files": []}
+
+    def work():
+        folder = RESULTS_DIR / job_id
+        folder.mkdir(parents=True, exist_ok=True)
+        files, all_ok = [], True
+        for a in artifacts:
+            try:
+                url = f"{host['url']}/job/{host_job_id}/artifact/{a['name']}"
+                with urllib.request.urlopen(url, timeout=60) as r:
+                    data = r.read()
+                (folder / a["name"]).write_bytes(data)
+                fingerprint = hashlib.sha256(data).hexdigest()
+                ok = fingerprint == a["sha256"]
+                all_ok &= ok
+                files.append({"name": a["name"], "size_bytes": len(data), "sha256": fingerprint,
+                              "verified": ok, "url": f"/api/jobs/{job_id}/files/{a['name']}"})
+            except Exception as e:
+                all_ok = False
+                files.append({"name": a["name"], "error": str(e)})
+        job["delivery"] = {"status": "delivered" if all_ok else "failed", "files": files,
+                           "folder": str(folder)}
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
 # 7. STARTING JOBS: peer host, or cloud fallback
 # ---------------------------------------------------------------------------
 def start_on_host(h, req, quote):
@@ -307,7 +342,7 @@ def cloud_detail(job):
 # ---------------------------------------------------------------------------
 # 8. WEB SERVER
 # ---------------------------------------------------------------------------
-app = FastAPI(title="GPUSetu Marketplace")
+app = FastAPI(title="NammaGPU Marketplace")
 
 
 class JobRequest(BaseModel):
@@ -315,7 +350,14 @@ class JobRequest(BaseModel):
 
 
 @app.get("/")
-def dashboard():
+def product_app():
+    """The NammaGPU product: home, rent, share your GPU, how we verify."""
+    return FileResponse(BASE_DIR / "static" / "app.html")
+
+
+@app.get("/console")
+def demo_console():
+    """The original single-screen demo console (backup for live demos)."""
     return FileResponse(BASE_DIR / "static" / "dashboard.html")
 
 
@@ -350,6 +392,7 @@ def chain_info():
         return {
             "enabled": True, "symbol": SYMBOL,
             "contract": chain.cfg["contract_address"],
+            "explorer_tx_url": chain.cfg.get("explorer_tx_url", ""),
             "rate_per_sec": onchain_rate, "lock_amount": LOCK_AMOUNT, "min_stake": MIN_STAKE,
             "buyer_balance": round(chain.balance("buyer"), 6),
             "host_balance": round(chain.balance("host"), 6),
@@ -409,6 +452,14 @@ def job_detail(job_id: str):
 
     if host_job["status"] != "running":
         job.setdefault("audit", anomaly_agent(host_job, bill))
+        with delivery_guard:
+            if "delivery" not in job:
+                if job["audit"]["verdict"] == "fraud":
+                    job["delivery"] = {"status": "withheld", "files": []}   # a cheater's output isn't trusted
+                elif host_job.get("artifacts"):
+                    deliver_in_background(job_id, host, job["host_job_id"], host_job["artifacts"])
+                else:
+                    job["delivery"] = {"status": "none", "files": []}
         if job["audit"]["verdict"] == "fraud":
             bill["billed_amount"] = 0                # a caught cheater earns nothing
         with settle_guard:
@@ -428,6 +479,16 @@ def job_detail(job_id: str):
         "log_tail": host_job.get("log_tail", []),
         "bill": bill,
     }
+
+
+@app.get("/api/jobs/{job_id}/files/{name}")
+def job_file(job_id: str, name: str):
+    """Download a delivered file (only files that were delivered and verified)."""
+    job = jobs.get(job_id) or {}
+    delivered = {f["name"] for f in job.get("delivery", {}).get("files", []) if f.get("verified")}
+    if name not in delivered:
+        raise HTTPException(404, "No such delivered file")
+    return FileResponse(RESULTS_DIR / job_id / name, filename=name)
 
 
 @app.get("/api/jobs")
