@@ -8,6 +8,7 @@ Then, from the Aspire Lite, open:  http://<ALG-IP>:8000/docs
 """
 
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -32,6 +33,40 @@ LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 OUTPUT_ROOT = BASE_DIR / "outputs"     # each job's deliverables: outputs/<job_id>/
 OUTPUT_ROOT.mkdir(exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# HOST SETTINGS: the owner's controls, remembered across restarts (settings.json)
+# ---------------------------------------------------------------------------
+SETTINGS_PATH = BASE_DIR / "settings.json"
+DEFAULT_SETTINGS = {
+    "online": True,              # the owner's "taking jobs" switch
+    "max_temp_c": 85,            # safety limit: stop taking new jobs above this temperature
+    "marketplace_url": "",       # where the portal reads earnings from, e.g. http://10.84.248.203:9000
+}
+
+
+def load_settings():
+    try:
+        return {**DEFAULT_SETTINGS, **json.loads(SETTINGS_PATH.read_text())}
+    except Exception:
+        return dict(DEFAULT_SETTINGS)
+
+
+settings = load_settings()
+heat_pause = {"active": False, "temp_c": None}   # set by the temperature guard, not saved
+
+
+def save_settings():
+    SETTINGS_PATH.write_text(json.dumps(settings, indent=2))
+
+
+def pause_reason():
+    """Why the host is not taking new jobs right now (None = taking jobs)."""
+    if not settings["online"]:
+        return "the owner paused it"
+    if heat_pause["active"]:
+        return f"GPU too hot ({heat_pause['temp_c']} °C, limit {settings['max_temp_c']} °C)"
+    return None
 
 # Only these jobs are allowed to run. A buyer picks a NAME, never sends code.
 ALLOWED_JOBS = {
@@ -283,7 +318,7 @@ def log_tail(job_id, lines=8):
 # ---------------------------------------------------------------------------
 # 4. THE WEB SERVER — the "counters" other laptops can call
 # ---------------------------------------------------------------------------
-app = FastAPI(title="GPUSetu Host Daemon")
+app = FastAPI(title="NammaGPU Host Daemon")
 
 # Let the dashboard (running on the Aspire Lite) call us from a browser.
 app.add_middleware(
@@ -301,12 +336,69 @@ class JobRequest(BaseModel):
 @app.get("/")
 def health():
     """Is the host alive, and is it free?"""
+    reason = pause_reason()
+    status = "busy" if current_job_id() else ("paused" if reason else "idle")
     return {
         "host_id": HOST_ID,
         "gpu": GPU_NAME,
-        "status": "busy" if current_job_id() else "idle",
+        "status": status,
+        "pause_reason": reason,
         "sandbox": "docker" if SANDBOX else "none",
     }
+
+
+# ---------------------------------------------------------------------------
+# HOST PORTAL: the owner's own page and controls (only meant for this laptop)
+# ---------------------------------------------------------------------------
+class SettingsUpdate(BaseModel):
+    online: bool | None = None
+    max_temp_c: int | None = None
+    marketplace_url: str | None = None
+
+
+@app.get("/portal")
+def portal():
+    return FileResponse(BASE_DIR / "static" / "portal.html")
+
+
+@app.get("/host/settings")
+def get_settings():
+    return {**settings, "pause_reason": pause_reason(), "heat_paused": heat_pause["active"],
+            "host_id": HOST_ID, "gpu": GPU_NAME, "sandbox": "docker" if SANDBOX else "none",
+            "sandbox_reason": SANDBOX_REASON, "running_job": current_job_id()}
+
+
+@app.post("/host/settings")
+def update_settings(update: SettingsUpdate):
+    if update.online is not None:
+        settings["online"] = update.online
+    if update.max_temp_c is not None:
+        if not 60 <= update.max_temp_c <= 95:
+            raise HTTPException(400, "Choose a temperature limit between 60 and 95 °C.")
+        settings["max_temp_c"] = update.max_temp_c
+    if update.marketplace_url is not None:
+        settings["marketplace_url"] = update.marketplace_url.strip().rstrip("/")
+    save_settings()
+    return get_settings()
+
+
+def temperature_guard():
+    """Every 5 seconds: pause new jobs if the GPU is too hot, resume once it cools by 10 °C."""
+    while True:
+        try:
+            temp = read_gpu().get("temp_c")
+            if temp is not None:
+                heat_pause["temp_c"] = temp
+                if temp >= settings["max_temp_c"]:
+                    heat_pause["active"] = True
+                elif temp <= settings["max_temp_c"] - 10:
+                    heat_pause["active"] = False
+        except Exception as e:
+            print(f"Temperature guard: {e}", flush=True)
+        time.sleep(5)
+
+
+threading.Thread(target=temperature_guard, daemon=True).start()
 
 
 @app.get("/stats")
@@ -326,7 +418,10 @@ def run_job(req: JobRequest):
         raise HTTPException(400, f"Unknown job '{req.job_type}'. Allowed: {list(ALLOWED_JOBS)}")
 
     if current_job_id():
-        raise HTTPException(409, "Host busy")   # later: backend sees this -> cloud fallback
+        raise HTTPException(409, "Host busy")   # backend sees this -> cloud fallback
+    reason = pause_reason()
+    if reason:
+        raise HTTPException(409, f"Host paused: {reason}")
 
     job_id = uuid.uuid4().hex[:8]
     with lock:
