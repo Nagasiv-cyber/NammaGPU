@@ -7,6 +7,8 @@ Start it with:
 Then, from the Aspire Lite, open:  http://<ALG-IP>:8000/docs
 """
 
+import hashlib
+import os
 import shutil
 import subprocess
 import sys
@@ -17,6 +19,7 @@ from pathlib import Path
 
 import pynvml
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -27,6 +30,8 @@ HOST_ID = "acer-alg-rtx3050-6gb"
 BASE_DIR = Path(__file__).parent
 LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
+OUTPUT_ROOT = BASE_DIR / "outputs"     # each job's deliverables: outputs/<job_id>/
+OUTPUT_ROOT.mkdir(exist_ok=True)
 
 # Only these jobs are allowed to run. A buyer picks a NAME, never sends code.
 ALLOWED_JOBS = {
@@ -84,10 +89,10 @@ SANDBOX, SANDBOX_REASON = docker_ready()
 print(f"Sandbox: {'ON (Docker, ' + SANDBOX_REASON + ')' if SANDBOX else 'OFF: ' + SANDBOX_REASON}")
 
 
-def job_command(job_id, script_path):
+def job_command(job_id, script_path, out_dir):
     """The command that runs one job: sealed container if possible, plain Python otherwise."""
     if not SANDBOX:
-        return [sys.executable, str(script_path)]
+        return [sys.executable, str(script_path)]      # OUTPUT_DIR is passed as an environment variable
     return [
         DOCKER_EXE, "run", "--rm",
         "--name", f"gpusetu-{job_id}",
@@ -96,6 +101,8 @@ def job_command(job_id, script_path):
         "--read-only",                                # can't change anything inside the container
         "--tmpfs", "/tmp:rw,size=256m",               # a small scratch space that vanishes afterwards
         "-v", f"{script_path.parent}:/work:ro",       # job files visible, but read-only
+        "-v", f"{out_dir}:/out:rw",                   # the ONE writable folder: where results go
+        "-e", "OUTPUT_DIR=/out",
         "-w", "/work",
         "--user", "1000:1000", "-e", "HOME=/tmp",     # not the admin/root user
         "--cap-drop", "ALL",                          # no special Linux permissions
@@ -188,6 +195,8 @@ def run_and_watch(job_id, script_path):
     Built so that whatever goes wrong, the job ALWAYS ends with a final status."""
     job = jobs[job_id]
     log_path = LOG_DIR / f"{job_id}.log"
+    out_dir = OUTPUT_ROOT / job_id
+    out_dir.mkdir(parents=True, exist_ok=True)
     proc = None
     timed_out = False
     error = None
@@ -195,10 +204,11 @@ def run_and_watch(job_id, script_path):
     try:
         with open(log_path, "w") as log:
             proc = subprocess.Popen(
-                job_command(job_id, script_path),
+                job_command(job_id, script_path, out_dir),
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 cwd=str(script_path.parent),
+                env={**os.environ, "OUTPUT_DIR": str(out_dir)},
             )
             with lock:
                 job["pid"] = proc.pid
@@ -239,9 +249,28 @@ def run_and_watch(job_id, script_path):
             # The host's BILLING CLAIM: "my GPU worked for the whole job".
             # A normal rental would charge this. GPUSetu checks it against the telemetry.
             job["claimed_seconds"] = int(job["runtime_s"])
+            job["artifacts"] = list_artifacts(out_dir)
             job["busy_seconds"] = sum(1 for s in samples if s["gpu_util"] >= BUSY_THRESHOLD)
             job["peak_util"] = max((s["gpu_util"] for s in samples), default=0)
             job["peak_mem_mb"] = max((s["mem_used_mb"] or 0 for s in samples), default=0)
+
+
+def sha256_of(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def list_artifacts(out_dir):
+    """Every file the job produced, with size and SHA-256 fingerprint."""
+    try:
+        return [{"name": p.name, "size_bytes": p.stat().st_size, "sha256": sha256_of(p)}
+                for p in sorted(out_dir.iterdir()) if p.is_file()]
+    except Exception as e:
+        print(f"Could not list outputs in {out_dir}: {e}", flush=True)
+        return []
 
 
 def log_tail(job_id, lines=8):
@@ -331,6 +360,17 @@ def job_status(job_id: str):
         result["samples"] = list(job["samples"])
     result["log_tail"] = log_tail(job_id)
     return result
+
+
+@app.get("/job/{job_id}/artifact/{name}")
+def job_artifact(job_id: str, name: str):
+    """Download one file the job produced (only names the job actually listed)."""
+    with lock:
+        job = jobs.get(job_id)
+        allowed = {a["name"] for a in (job or {}).get("artifacts", [])}
+    if name not in allowed:
+        raise HTTPException(404, "No such file for this job")
+    return FileResponse(OUTPUT_ROOT / job_id / name, filename=name)
 
 
 @app.get("/jobs")

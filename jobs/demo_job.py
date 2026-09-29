@@ -1,8 +1,16 @@
 """
 GPUSetu demo job — trains a small image-recognition model on MNIST
 (handwritten digits) for about 30 seconds so the GPU graph visibly climbs.
+
+At the end it saves what the buyer paid for into OUTPUT_DIR (the sandbox's only
+writable folder):
+  model.pt          the trained weights
+  load_model.py     a ready-to-run script to load and use the model
+  model_card.json   what was trained, how long, and how accurate it is
 """
 
+import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -84,7 +92,84 @@ def main():
             preds = model(xt[i:i + 1000]).argmax(1)       # score on UNSEEN test images
             correct += (preds == yt[i:i + 1000]).sum().item()
     acc = correct / 10000
-    print(f"DONE: {steps} steps in {time.time() - start:.1f}s, test accuracy={acc:.2%}", flush=True)
+    train_seconds = time.time() - start
+    save_outputs(model, steps, train_seconds, acc)
+    print(f"DONE: {steps} steps in {train_seconds:.1f}s, test accuracy={acc:.2%}", flush=True)
+
+
+LOADER = '''"""Load the model trained on GPUSetu and read a handwritten digit.
+
+Usage:  python load_model.py            (checks the model loads)
+In code:  from load_model import load;  model = load("model.pt")
+"""
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class SmallCNN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(1, 64, 3, padding=1)
+        self.conv2 = nn.Conv2d(64, 128, 3, padding=1)
+        self.fc1 = nn.Linear(128 * 7 * 7, 256)
+        self.fc2 = nn.Linear(256, 10)
+
+    def forward(self, x):
+        x = F.max_pool2d(F.relu(self.conv1(x)), 2)
+        x = F.max_pool2d(F.relu(self.conv2(x)), 2)
+        x = x.flatten(1)
+        x = F.relu(self.fc1(x))
+        return self.fc2(x)
+
+
+def load(path="model.pt"):
+    model = SmallCNN()
+    model.load_state_dict(torch.load(path, map_location="cpu"))
+    return model.eval()
+
+
+def predict(model, image_28x28):
+    """image_28x28: a 28x28 tensor of values 0..1 (white digit on black, like MNIST)."""
+    with torch.no_grad():
+        return int(model(image_28x28.reshape(1, 1, 28, 28).float()).argmax(1))
+
+
+if __name__ == "__main__":
+    m = load()
+    print("Model loaded:", sum(p.numel() for p in m.parameters()), "parameters")
+    print("Prediction on a blank image:", predict(m, torch.zeros(28, 28)))
+'''
+
+
+def save_outputs(model, steps, train_seconds, accuracy):
+    """Write the buyer's deliverables. Skipped if no OUTPUT_DIR was given."""
+    out = os.environ.get("OUTPUT_DIR")
+    if not out:
+        print("No OUTPUT_DIR set: model not saved.", flush=True)
+        return
+    try:
+        out = Path(out)
+        torch.save(model.cpu().state_dict(), out / "model.pt")
+        (out / "load_model.py").write_text(LOADER)
+        (out / "model_card.json").write_text(json.dumps({
+            "task": "handwritten digit recognition (MNIST, 10 classes)",
+            "architecture": "SmallCNN: 2 conv layers (64, 128 filters) + 2 dense layers",
+            "parameters": sum(p.numel() for p in model.parameters()),
+            "training_steps": steps,
+            "batch_size": BATCH_SIZE,
+            "training_seconds": round(train_seconds, 1),
+            "test_accuracy": round(accuracy, 4),
+            "test_set": "10,000 MNIST images never seen during training",
+            "trained_on": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "unknown",
+            "framework": f"PyTorch {torch.__version__}",
+            "how_to_load": "python load_model.py   or   from load_model import load; model = load('model.pt')",
+            "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }, indent=2))
+        size_mb = (out / "model.pt").stat().st_size / 1e6
+        print(f"SAVED: model.pt ({size_mb:.1f} MB), load_model.py, model_card.json", flush=True)
+    except Exception as e:
+        print(f"WARNING: could not save outputs ({e})", flush=True)
 
 
 if __name__ == "__main__":
