@@ -7,6 +7,7 @@ Start it with:
 Then, from the Aspire Lite, open:  http://<ALG-IP>:8000/docs
 """
 
+import shutil
 import subprocess
 import sys
 import threading
@@ -30,6 +31,7 @@ LOG_DIR.mkdir(exist_ok=True)
 # Only these jobs are allowed to run. A buyer picks a NAME, never sends code.
 ALLOWED_JOBS = {
     "mnist": BASE_DIR / "jobs" / "demo_job.py",
+    "fake": BASE_DIR / "jobs" / "fake_job.py",     # FRAUD DEMO ONLY: pretends to work
 }
 
 # A second counts as "GPU really working" if utilization is at least this %.
@@ -37,6 +39,76 @@ BUSY_THRESHOLD = 20
 
 # Safety net: any job running longer than this gets killed, so the host never gets stuck.
 MAX_JOB_SECONDS = 120
+
+# ---------------------------------------------------------------------------
+# SANDBOX: run every job inside a sealed Docker container (Phase 2)
+# ---------------------------------------------------------------------------
+USE_DOCKER = True                                           # set False to turn the sandbox off
+DOCKER_IMAGE = "pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime"
+
+# Find docker.exe even if this terminal's PATH is out of date (e.g. an IDE opened before
+# Docker was installed). You can also point to it directly with the DOCKER_EXE environment variable.
+import os
+_local = os.environ.get("LOCALAPPDATA", "")
+DOCKER_CANDIDATES = [
+    os.environ.get("DOCKER_EXE", ""),
+    r"C:\Program Files\Docker\Docker\resources\bin\docker.exe",
+    r"C:\ProgramData\DockerDesktop\version-bin\docker.exe",
+    os.path.join(_local, r"Programs\DockerDesktop\resources\bin\docker.exe"),
+    os.path.join(_local, r"Programs\Docker\Docker\resources\bin\docker.exe"),
+    os.path.join(_local, r"Docker\resources\bin\docker.exe"),
+]
+DOCKER_EXE = shutil.which("docker") or next((p for p in DOCKER_CANDIDATES if p and Path(p).exists()), None)
+
+
+def docker_ready():
+    """Sandbox only if Docker is installed, running, and the PyTorch image is downloaded.
+    Returns (ready, reason) so the startup message can say WHY it's off."""
+    if not USE_DOCKER:
+        return False, "USE_DOCKER is set to False"
+    if DOCKER_EXE is None:
+        return False, "Docker is not installed (docker.exe not found)"
+    try:
+        engine = subprocess.run([DOCKER_EXE, "info"], capture_output=True, timeout=20)
+        if engine.returncode != 0:
+            return False, "Docker engine not running. Open Docker Desktop and wait for it to start"
+        image = subprocess.run([DOCKER_EXE, "image", "inspect", DOCKER_IMAGE], capture_output=True, timeout=20)
+        if image.returncode != 0:
+            return False, f"image not downloaded yet. Run: docker pull {DOCKER_IMAGE}"
+    except Exception as e:
+        return False, f"could not talk to Docker ({e})"
+    return True, DOCKER_IMAGE
+
+
+SANDBOX, SANDBOX_REASON = docker_ready()
+print(f"Sandbox: {'ON (Docker, ' + SANDBOX_REASON + ')' if SANDBOX else 'OFF: ' + SANDBOX_REASON}")
+
+
+def job_command(job_id, script_path):
+    """The command that runs one job: sealed container if possible, plain Python otherwise."""
+    if not SANDBOX:
+        return [sys.executable, str(script_path)]
+    return [
+        DOCKER_EXE, "run", "--rm",
+        "--name", f"gpusetu-{job_id}",
+        "--gpus", "all",                              # the GPU is the ONLY thing shared with the job
+        "--network", "none",                          # no internet: can't leak data or download malware
+        "--read-only",                                # can't change anything inside the container
+        "--tmpfs", "/tmp:rw,size=256m",               # a small scratch space that vanishes afterwards
+        "-v", f"{script_path.parent}:/work:ro",       # job files visible, but read-only
+        "-w", "/work",
+        "--user", "1000:1000", "-e", "HOME=/tmp",     # not the admin/root user
+        "--cap-drop", "ALL",                          # no special Linux permissions
+        "--security-opt", "no-new-privileges",
+        "--memory", "4g", "--cpus", "4", "--pids-limit", "256",   # can't hog the laptop
+        DOCKER_IMAGE,
+        "python", "-u", script_path.name,
+    ]
+
+
+def stop_container(job_id):
+    if SANDBOX:
+        subprocess.run([DOCKER_EXE, "kill", f"gpusetu-{job_id}"], capture_output=True, timeout=20)
 
 # ---------------------------------------------------------------------------
 # 2. CONNECT TO THE GPU (NVML = NVIDIA's built-in reporting library)
@@ -123,7 +195,7 @@ def run_and_watch(job_id, script_path):
     try:
         with open(log_path, "w") as log:
             proc = subprocess.Popen(
-                [sys.executable, str(script_path)],
+                job_command(job_id, script_path),
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 cwd=str(script_path.parent),
@@ -133,7 +205,8 @@ def run_and_watch(job_id, script_path):
 
             while proc.poll() is None:          # None means "still running"
                 if time.time() - job["started_at"] > MAX_JOB_SECONDS:
-                    proc.kill()                  # stuck job -> force stop
+                    stop_container(job_id)       # stuck job -> force stop (container first)
+                    proc.kill()
                     proc.wait()
                     timed_out = True
                     break
@@ -148,6 +221,7 @@ def run_and_watch(job_id, script_path):
         error = str(e)
         print(f"[{job_id}] watcher error: {e}", flush=True)
         if proc and proc.poll() is None:
+            stop_container(job_id)
             proc.kill()
     finally:
         ended = time.time()
@@ -162,6 +236,9 @@ def run_and_watch(job_id, script_path):
                 job["status"] = "finished" if proc and proc.returncode == 0 else "failed"
             job["ended_at"] = round(ended, 2)
             job["runtime_s"] = round(ended - job["started_at"], 1)
+            # The host's BILLING CLAIM: "my GPU worked for the whole job".
+            # A normal rental would charge this. GPUSetu checks it against the telemetry.
+            job["claimed_seconds"] = int(job["runtime_s"])
             job["busy_seconds"] = sum(1 for s in samples if s["gpu_util"] >= BUSY_THRESHOLD)
             job["peak_util"] = max((s["gpu_util"] for s in samples), default=0)
             job["peak_mem_mb"] = max((s["mem_used_mb"] or 0 for s in samples), default=0)
@@ -199,6 +276,7 @@ def health():
         "host_id": HOST_ID,
         "gpu": GPU_NAME,
         "status": "busy" if current_job_id() else "idle",
+        "sandbox": "docker" if SANDBOX else "none",
     }
 
 
@@ -228,6 +306,7 @@ def run_job(req: JobRequest):
             "job_type": req.job_type,
             "host_id": HOST_ID,
             "status": "running",
+            "sandbox": "docker" if SANDBOX else "none",
             "started_at": round(time.time(), 2),
             "samples": [],
         }
