@@ -1,8 +1,8 @@
-# GPUSetu
+# NAMMAGPU
 
 **Pay only for GPU seconds that did real work.**
 
-GPUSetu is a peer-to-peer GPU marketplace for Indian students. Idle campus and gaming-café GPUs rent out compute by the second. Every second is measured directly from the graphics card, payment is locked in escrow on **MST Blockchain** before the job starts, and hosts who fake work lose their security deposit.
+NAMMAGPU is a peer-to-peer GPU marketplace for Indian students. Idle campus and gaming-café GPUs rent out compute by the second. Every second is measured directly from the graphics card, payment is locked in escrow on **MST Blockchain** before the job starts, and hosts who fake work lose their security deposit.
 
 Built as a working prototype on two real laptops: an **Acer ALG with an RTX 3050 (6 GB)** as the GPU host, and an **Acer Aspire Lite** as the marketplace and buyer.
 
